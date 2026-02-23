@@ -18,10 +18,17 @@ const (
 
 // Pipeline wires the parser stages together:
 // raw bytes → ANSI strip → line accumulate → conversation parse → event emit.
+// When an AI tool is the foreground process, lines are also fed to the
+// appropriate AI enhancement parser which emits supplemental ai_* events.
 type Pipeline struct {
 	stripper     *ANSIStripper
 	accumulator  *Accumulator
 	conversation *ConversationParser
+
+	// AI enhancement parsers (nil when inactive)
+	claudeParser *ClaudeParser
+	aiderParser  *AiderParser
+	activeAI     string // current tool_type driving AI parsing ("claude_code", "aider", "")
 
 	events chan Event
 
@@ -53,19 +60,37 @@ func NewPipeline() *Pipeline {
 
 	conv = NewConversationParser(emitEvent)
 
-	accum = NewAccumulator(defaultFlushTimeout, func(line Line) {
-		conv.FeedLine(line)
-	})
+	// AI parsers share the same emit callback so their events go to the same channel
+	claudeP := NewClaudeParser(emitEvent)
+	aiderP := NewAiderParser(emitEvent)
 
-	stripper := NewANSIStripper()
-
+	// Line callback: feed lines to conversation parser and active AI parser
 	p := &Pipeline{
-		stripper:     stripper,
-		accumulator:  accum,
+		stripper:     NewANSIStripper(),
 		conversation: conv,
+		claudeParser: claudeP,
+		aiderParser:  aiderP,
 		events:       events,
 		chunkTicker:  time.NewTicker(outputChunkInterval),
 	}
+
+	accum = NewAccumulator(defaultFlushTimeout, func(line Line) {
+		// Always feed the base conversation parser
+		conv.FeedLine(line)
+
+		// Also feed the active AI parser if one is active
+		// Only feed text lines (markers are for the conversation parser)
+		if line.Text != "" {
+			switch p.activeAI {
+			case "claude_code":
+				p.claudeParser.FeedLine(line)
+			case "aider":
+				p.aiderParser.FeedLine(line)
+			}
+		}
+	})
+
+	p.accumulator = accum
 
 	// Background goroutine for periodic output flushing
 	go p.chunkFlusher()
@@ -127,10 +152,25 @@ func (p *Pipeline) SetCWD(cwd string) {
 	p.conversation.SetCWD(cwd)
 }
 
-// SetProcess updates the foreground process context.
+// SetProcess updates the foreground process context and activates/deactivates
+// the appropriate AI enhancement parser.
 func (p *Pipeline) SetProcess(name, toolType string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// If AI tool type changed, flush and reset the old AI parser
+	if p.activeAI != toolType {
+		switch p.activeAI {
+		case "claude_code":
+			p.claudeParser.Flush()
+			p.claudeParser.Reset()
+		case "aider":
+			p.aiderParser.Flush()
+			p.aiderParser.Reset()
+		}
+		p.activeAI = toolType
+	}
+
 	p.conversation.SetProcess(name, toolType)
 }
 
@@ -165,6 +205,15 @@ func (p *Pipeline) Close() {
 	p.closed = true
 
 	p.chunkTicker.Stop()
+
+	// Flush AI parsers before closing
+	switch p.activeAI {
+	case "claude_code":
+		p.claudeParser.Flush()
+	case "aider":
+		p.aiderParser.Flush()
+	}
+
 	p.accumulator.Close()
 	p.conversation.Close()
 	close(p.events)

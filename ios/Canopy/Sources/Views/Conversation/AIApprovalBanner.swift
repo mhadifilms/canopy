@@ -3,31 +3,40 @@ import SwiftUI
 /// Sticky banner above the input bar for AI approval requests.
 ///
 /// Shows the action description, optional diff preview,
-/// and large Approve/Reject buttons (min 44x44pt).
-/// Haptic feedback on appear and on action.
+/// and full-width Approve/Reject buttons (56pt height per spec).
+/// Haptic feedback on appear (notification) and on action (impact).
 struct AIApprovalBanner: View {
     let approval: SessionEvent.AIApproval
     let onApprove: () -> Void
     let onReject: () -> Void
 
     @State private var showDiff = false
+    @State private var appeared = false
 
     var body: some View {
-        VStack(spacing: 10) {
-            HStack {
+        VStack(spacing: 12) {
+            // Action description header
+            HStack(spacing: 8) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
-                Text(approval.description)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(2)
+                    .font(.body)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(approval.description)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(2)
+                    Text(actionTypeLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
             }
 
+            // Diff toggle and preview
             if let diff = approval.diff {
                 Button {
-                    withAnimation { showDiff.toggle() }
+                    withAnimation(.easeInOut(duration: 0.2)) { showDiff.toggle() }
                 } label: {
-                    HStack {
+                    HStack(spacing: 4) {
                         Text(showDiff ? "Hide diff" : "Show diff")
                             .font(.caption)
                         Image(systemName: showDiff ? "chevron.up" : "chevron.down")
@@ -35,6 +44,7 @@ struct AIApprovalBanner: View {
                     }
                     .foregroundStyle(.accentColor)
                 }
+                .frame(minHeight: 44)
                 .accessibilityLabel(showDiff ? "Hide code diff" : "Show code diff")
 
                 if showDiff {
@@ -43,42 +53,70 @@ struct AIApprovalBanner: View {
                 }
             }
 
+            // Full-width action buttons
             HStack(spacing: 12) {
                 Button(role: .destructive) {
-                    let generator = UIImpactFeedbackGenerator(style: .medium)
-                    generator.impactOccurred()
+                    triggerImpactHaptic()
                     onReject()
                 } label: {
                     Label("Reject", systemImage: "xmark")
-                        .font(.body.weight(.medium))
+                        .font(.body.weight(.semibold))
                         .frame(maxWidth: .infinity)
-                        .frame(minHeight: 44)
+                        .frame(height: 56)
                 }
                 .buttonStyle(.bordered)
                 .tint(.red)
                 .accessibilityLabel("Reject this action")
 
                 Button {
-                    let generator = UIImpactFeedbackGenerator(style: .medium)
-                    generator.impactOccurred()
+                    triggerImpactHaptic()
                     onApprove()
                 } label: {
                     Label("Approve", systemImage: "checkmark")
-                        .font(.body.weight(.medium))
+                        .font(.body.weight(.semibold))
                         .frame(maxWidth: .infinity)
-                        .frame(minHeight: 44)
+                        .frame(height: 56)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.green)
                 .accessibilityLabel("Approve this action")
             }
         }
-        .padding(12)
+        .padding(16)
         .background(
-            RoundedRectangle(cornerRadius: 12)
+            RoundedRectangle(cornerRadius: 16)
                 .fill(Color(.systemBackground))
-                .shadow(color: .black.opacity(0.1), radius: 8, y: -2)
+                .shadow(color: .black.opacity(0.12), radius: 12, y: -4)
         )
-        .sensoryFeedback(.warning, trigger: approval.description)
+        .onAppear {
+            if !appeared {
+                appeared = true
+                triggerNotificationHaptic()
+            }
+        }
+    }
+
+    private var actionTypeLabel: String {
+        switch approval.action {
+        case .editFile: "File edit"
+        case .writeFile: "New file"
+        case .runCommand: "Command execution"
+        case .readFile: "File read"
+        case .search: "Search"
+        }
+    }
+
+    private func triggerImpactHaptic() {
+        #if os(iOS)
+        let generator = UIImpactFeedbackGenerator(style: .medium)
+        generator.impactOccurred()
+        #endif
+    }
+
+    private func triggerNotificationHaptic() {
+        #if os(iOS)
+        let generator = UINotificationFeedbackGenerator()
+        generator.notificationOccurred(.warning)
+        #endif
     }
 }

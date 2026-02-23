@@ -14,9 +14,12 @@ import (
 
 	"github.com/canopy-dev/canopyd/internal/api"
 	"github.com/canopy-dev/canopyd/internal/config"
+	"github.com/canopy-dev/canopyd/internal/coord"
+	"github.com/canopy-dev/canopyd/internal/install"
 	"github.com/canopy-dev/canopyd/internal/parser"
 	"github.com/canopy-dev/canopyd/internal/process"
 	"github.com/canopy-dev/canopyd/internal/protocol"
+	"github.com/canopy-dev/canopyd/internal/push"
 	"github.com/canopy-dev/canopyd/internal/session"
 	"github.com/canopy-dev/canopyd/internal/storage"
 	"github.com/canopy-dev/canopyd/internal/wireguard"
@@ -25,15 +28,17 @@ import (
 
 // Daemon is the main canopyd background process.
 type Daemon struct {
-	cfg      *config.Config
-	logger   *zap.Logger
-	registry *session.Registry
-	store    *storage.Store
-	apiSrv   *api.Server
-	wgEP     *wireguard.Endpoint
-	listener net.Listener
-	mu       sync.Mutex
-	cancel   context.CancelFunc
+	cfg         *config.Config
+	logger      *zap.Logger
+	registry    *session.Registry
+	store       *storage.Store
+	apiSrv      *api.Server
+	wgEP        *wireguard.Endpoint
+	coordClient *coord.Client
+	pushSvc     *push.Service
+	listener    net.Listener
+	mu          sync.Mutex
+	cancel      context.CancelFunc
 
 	// Per-session parser pipelines. Protected by pipelineMu.
 	pipelineMu sync.Mutex
@@ -104,6 +109,59 @@ func (d *Daemon) Start(ctx context.Context) error {
 		d.logger.Warn("wireguard endpoint start failed, API will still listen", zap.Error(err))
 	} else {
 		defer d.wgEP.Stop()
+	}
+
+	// 3b. Initialize coordination server client and push notification service.
+	identityPub, identityPriv, err := wireguard.LoadIdentityKeyPair()
+	if err != nil {
+		d.logger.Warn("load identity keys for coord client failed, coordination disabled", zap.Error(err))
+	} else {
+		wgPubKey, err := wireguard.LoadWireGuardPublicKey()
+		if err != nil {
+			d.logger.Warn("load WG public key for coord client failed, coordination disabled", zap.Error(err))
+		} else {
+			// Collect paired device WG keys.
+			var pairedWGKeys []string
+			var apnsTokens []string
+			devices, err := install.LoadPairedDevices()
+			if err != nil {
+				d.logger.Warn("load paired devices failed", zap.Error(err))
+			} else {
+				for _, dev := range devices {
+					if dev.WGPublicKey != "" {
+						pairedWGKeys = append(pairedWGKeys, dev.WGPublicKey)
+					}
+					if dev.APNSToken != "" {
+						apnsTokens = append(apnsTokens, dev.APNSToken)
+					}
+				}
+			}
+
+			coordClient := coord.NewClient(coord.ClientConfig{
+				CoordURL:     d.cfg.CoordURL,
+				IdentityPub:  identityPub,
+				IdentityPriv: identityPriv,
+				WGPubKey:     wgPubKey[:],
+				WGPort:       wgEP.Port(),
+				PairedWGKeys: pairedWGKeys,
+			}, d.logger)
+			coordClient.Start(ctx)
+			d.coordClient = coordClient
+			defer coordClient.Stop()
+
+			hostname, _ := config.Hostname()
+			pushSvc := push.NewService(coordClient, push.DefaultTriggerConfig(), hostname, d.logger)
+			if len(apnsTokens) > 0 {
+				pushSvc.SetAPNSTokens(apnsTokens)
+			}
+			d.pushSvc = pushSvc
+
+			d.logger.Info("coordination client started",
+				zap.String("coord_url", d.cfg.CoordURL),
+				zap.Int("paired_devices", len(pairedWGKeys)),
+				zap.Int("apns_tokens", len(apnsTokens)),
+			)
+		}
 	}
 
 	// 4. Start the Unix domain socket server.
@@ -366,6 +424,11 @@ func (d *Daemon) consumePipelineEvents(sess *session.Session, pipeline *parser.P
 			)
 		}
 
+		// Evaluate push notification triggers.
+		if d.pushSvc != nil {
+			d.pushSvc.HandleEvent(context.Background(), sess.Meta.SessionID, event)
+		}
+
 		// Update session metadata based on event type.
 		switch event.Type {
 		case parser.EventUserInput:
@@ -487,6 +550,11 @@ func (d *Daemon) handleSessionEnd(sess *session.Session, end protocol.SessionEnd
 	}
 	if err := d.store.UpdateMeta(sess.Meta); err != nil {
 		d.logger.Error("update meta on end", zap.Error(err))
+	}
+
+	// Evaluate push notification triggers for session completion.
+	if d.pushSvc != nil {
+		d.pushSvc.HandleEvent(context.Background(), sess.Meta.SessionID, event)
 	}
 
 	// Notify API clients.

@@ -126,6 +126,26 @@ func EnsureKeys() (string, error) {
 	return DeviceID(identityPub), nil
 }
 
+// LoadIdentityKeyPair reads the Ed25519 identity keypair from disk.
+func LoadIdentityKeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
+	cfgDir, err := config.ConfigDir()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	pubData, err := os.ReadFile(filepath.Join(cfgDir, "identity.pub"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read identity public key: %w", err)
+	}
+
+	privData, err := os.ReadFile(filepath.Join(cfgDir, "identity.key"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read identity private key: %w", err)
+	}
+
+	return ed25519.PublicKey(pubData), ed25519.PrivateKey(privData), nil
+}
+
 // LoadWireGuardPrivateKey reads the WireGuard private key from disk.
 func LoadWireGuardPrivateKey() ([32]byte, error) {
 	var key [32]byte

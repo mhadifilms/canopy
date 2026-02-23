@@ -11,6 +11,7 @@ struct ConversationView: View {
     let appState: AppState
 
     @State private var inputText = ""
+    @State private var fileViewerPath: String?
 
     private var session: Session? {
         appState.sessionStore.sessions[sessionId]
@@ -99,6 +100,12 @@ struct ConversationView: View {
         .onDisappear {
             Task { await appState.unsubscribeFromSession(sessionId) }
         }
+        .sheet(item: $fileViewerPath) { path in
+            // File viewer requires content to be fetched via WebSocket read_file.
+            // For now, show a placeholder. Full implementation will send a read_file
+            // message and present the content when the fileContents response arrives.
+            FileViewerSheet(path: path, content: "Loading...", language: nil)
+        }
     }
 
     private var inputPlaceholder: String {
@@ -146,7 +153,9 @@ struct ConversationView: View {
             AIResponseBlock(payload: payload)
 
         case .aiAction(let payload):
-            AIActionCard(payload: payload)
+            AIActionCard(payload: payload) { path in
+                fileViewerPath = path
+            }
 
         case .aiApproval:
             // Rendered as the sticky banner above input bar, not inline
@@ -169,12 +178,39 @@ struct ConversationView: View {
     // MARK: - Helpers
 
     /// Check if a system_output at this index is replaced by a nearby ai_response.
+    ///
+    /// When AI events are available for a time range, the UI renders those instead
+    /// of raw system_output. We look forward from the current system_output to see
+    /// if an ai_response follows before the next user_input.
     private func isReplacedByAIResponse(at index: Int) -> Bool {
-        let searchEnd = min(index + 3, events.count)
+        // Look ahead for ai_response events that would cover this output
+        let searchEnd = min(index + 5, events.count)
         for i in (index + 1)..<searchEnd {
-            if case .aiResponse = events[i] { return true }
-            if case .userInput = events[i] { break }
+            switch events[i] {
+            case .aiResponse:
+                return true
+            case .userInput:
+                // New user input means we've passed the boundary
+                return false
+            default:
+                continue
+            }
         }
+
+        // Also look backward: if a recent ai_response preceded this system_output
+        // (within the same AI conversation turn), skip it
+        let searchStart = max(0, index - 3)
+        for i in stride(from: index - 1, through: searchStart, by: -1) {
+            switch events[i] {
+            case .aiResponse:
+                return true
+            case .userInput:
+                return false
+            default:
+                continue
+            }
+        }
+
         return false
     }
 
@@ -192,4 +228,10 @@ struct ConversationView: View {
         if case .systemOutput = events[index - 1] { return true }
         return false
     }
+}
+
+// MARK: - String Identifiable for sheet presentation
+
+extension String: @retroactive Identifiable {
+    public var id: String { self }
 }
