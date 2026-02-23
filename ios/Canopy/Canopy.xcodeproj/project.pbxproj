@@ -58,6 +58,7 @@
 		E3F0AA974B4D9062EC7A4367 /* CanopyConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54F16C2815BE6520FBD178EB /* CanopyConnection.swift */; };
 		E450CC58898ACE80E5603A7A /* RemoteInputIndicator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD3DF241F85B05072CDBF6FC /* RemoteInputIndicator.swift */; };
 		FE0991E3306D4BFDB046FECE /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79A9903AE4EF4BC0F36FA73F /* SettingsView.swift */; };
+		A1B2C3D4E5F60718192A3B4C /* WireGuardBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4E5F6071819A2B3C4D5E6F7 /* WireGuardBridge.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -124,6 +125,7 @@
 		E9F0A3BB1FCC95A4786F06D6 /* TunnelManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelManager.swift; sourceTree = "<group>"; };
 		EE5088E328B9BB52FEA58120 /* DeviceListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceListView.swift; sourceTree = "<group>"; };
 		F22D89D365FDEC51ECCDC692 /* SessionEventCodingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionEventCodingTests.swift; sourceTree = "<group>"; };
+		D4E5F6071819A2B3C4D5E6F7 /* WireGuardBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WireGuardBridge.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -200,6 +202,7 @@
 				299CB32B39AEDE56000A6D1E /* PairingManager.swift */,
 				E9F0A3BB1FCC95A4786F06D6 /* TunnelManager.swift */,
 				7BD6198A0B960FFA8D052BAF /* WebSocketMessage.swift */,
+				D4E5F6071819A2B3C4D5E6F7 /* WireGuardBridge.swift */,
 			);
 			path = Networking;
 			sourceTree = "<group>";
@@ -449,6 +452,7 @@
 				D7C0F785AF868A6462322055 /* UserInputBubble.swift in Sources */,
 				1636F0B2E9E7EDF134BB9A76 /* WebSocketMessage.swift in Sources */,
 				96CFF82860865EEE9F9DBBC2 /* WelcomeView.swift in Sources */,
+				A1B2C3D4E5F60718192A3B4C /* WireGuardBridge.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

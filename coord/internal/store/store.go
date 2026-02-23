@@ -32,20 +32,33 @@ type PairingRecord struct {
 	CreatedAt time.Time
 }
 
+// PairingSession tracks a 6-digit code pairing handshake between Mac and iPhone.
+type PairingSession struct {
+	Code      string
+	Status    string // "pending" or "confirmed"
+	Hostname  string
+	DeviceID  string
+	WGPub     string
+	Identity  string
+	CreatedAt time.Time
+}
+
 // Store is the in-memory storage backend for the coordination server.
 type Store struct {
-	mu       sync.RWMutex
-	devices  map[string]*DeviceRecord  // keyed by Ed25519 public key (base64)
-	pairings map[string]map[string]bool // device_key -> set of peer WG keys
-	wgIndex  map[string]string         // WG public key -> device Ed25519 key (for lookups)
+	mu              sync.RWMutex
+	devices         map[string]*DeviceRecord   // keyed by Ed25519 public key (base64)
+	pairings        map[string]map[string]bool  // device_key -> set of peer WG keys
+	wgIndex         map[string]string           // WG public key -> device Ed25519 key (for lookups)
+	pairingSessions map[string]*PairingSession  // keyed by 6-digit code
 }
 
 // New creates a new empty Store.
 func New() *Store {
 	return &Store{
-		devices:  make(map[string]*DeviceRecord),
-		pairings: make(map[string]map[string]bool),
-		wgIndex:  make(map[string]string),
+		devices:         make(map[string]*DeviceRecord),
+		pairings:        make(map[string]map[string]bool),
+		wgIndex:         make(map[string]string),
+		pairingSessions: make(map[string]*PairingSession),
 	}
 }
 
@@ -233,4 +246,66 @@ func (s *Store) DeviceCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.devices)
+}
+
+// CreatePairingSession stores a pending pairing session for a 6-digit code.
+func (s *Store) CreatePairingSession(code string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.pairingSessions[code] = &PairingSession{
+		Code:      code,
+		Status:    "pending",
+		CreatedAt: time.Now(),
+	}
+}
+
+// ConfirmPairingSession marks a pairing session as confirmed with Mac device info.
+func (s *Store) ConfirmPairingSession(code, hostname, deviceID, wgPub, identity string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sess, ok := s.pairingSessions[code]
+	if !ok {
+		return false
+	}
+	sess.Status = "confirmed"
+	sess.Hostname = hostname
+	sess.DeviceID = deviceID
+	sess.WGPub = wgPub
+	sess.Identity = identity
+	return true
+}
+
+// GetPairingSession retrieves a pairing session by code.
+// Returns nil if not found or expired (older than 5 minutes).
+func (s *Store) GetPairingSession(code string) *PairingSession {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sess, ok := s.pairingSessions[code]
+	if !ok {
+		return nil
+	}
+	if time.Since(sess.CreatedAt) > 5*time.Minute {
+		return nil
+	}
+	cp := *sess
+	return &cp
+}
+
+// CleanupPairingSessions removes pairing sessions older than 5 minutes.
+func (s *Store) CleanupPairingSessions() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cutoff := time.Now().Add(-5 * time.Minute)
+	removed := 0
+	for code, sess := range s.pairingSessions {
+		if sess.CreatedAt.Before(cutoff) {
+			delete(s.pairingSessions, code)
+			removed++
+		}
+	}
+	return removed
 }

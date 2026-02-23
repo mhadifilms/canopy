@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/canopy-dev/canopyd/internal/config"
@@ -46,6 +48,10 @@ type Server struct {
 	// writeToSession is called to write input to a session's PTY.
 	// Set by the daemon when starting the API server.
 	WriteToSession func(sessionID string, data []byte) error
+
+	// SignalSession is called to send a signal to a session's PTY process group.
+	// Set by the daemon when starting the API server.
+	SignalSession func(sessionID string, sig syscall.Signal) error
 }
 
 // Client represents a connected WebSocket client.
@@ -405,9 +411,40 @@ func (s *Server) handleInputRaw(ctx context.Context, client *Client, msg Incomin
 	}
 }
 
+// signalNames maps signal name strings to syscall signals.
+var signalNames = map[string]syscall.Signal{
+	"SIGINT":  syscall.SIGINT,
+	"SIGTERM": syscall.SIGTERM,
+	"SIGHUP":  syscall.SIGHUP,
+	"SIGQUIT": syscall.SIGQUIT,
+	"INT":     syscall.SIGINT,
+	"TERM":    syscall.SIGTERM,
+	"HUP":     syscall.SIGHUP,
+	"QUIT":    syscall.SIGQUIT,
+}
+
 func (s *Server) handleSignal(ctx context.Context, client *Client, msg IncomingMessage) {
-	// Signal handling will be connected to the session's PTY process.
-	s.sendError(ctx, client, "not_implemented", "signal forwarding not yet implemented")
+	if msg.SessionID == "" || msg.Signal == "" {
+		s.sendError(ctx, client, "invalid_signal", "session_id and signal required")
+		return
+	}
+	if s.SignalSession == nil {
+		s.sendError(ctx, client, "not_supported", "signal forwarding not supported")
+		return
+	}
+
+	sig, ok := signalNames[strings.ToUpper(msg.Signal)]
+	if !ok {
+		s.sendError(ctx, client, "unknown_signal", fmt.Sprintf("unknown signal: %s", msg.Signal))
+		return
+	}
+
+	if err := s.SignalSession(msg.SessionID, sig); err != nil {
+		s.sendError(ctx, client, "signal_error", err.Error())
+		return
+	}
+
+	s.send(ctx, client, OutgoingMessage{Type: "signal_sent", SessionID: msg.SessionID})
 }
 
 func (s *Server) handleReadFile(ctx context.Context, client *Client, msg IncomingMessage) {

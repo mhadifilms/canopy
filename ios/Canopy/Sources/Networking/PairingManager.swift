@@ -174,6 +174,9 @@ final class PairingManager: NSObject {
     // MARK: - Pairing Request
 
     /// Send the pairing request to the Mac (via coordination server or direct).
+    ///
+    /// After registering the pairing, polls the coordination server every 2 seconds
+    /// for up to 60 seconds waiting for the Mac to confirm.
     func sendPairingRequest(
         to payload: PairingQRPayload,
         coordinationClient: CoordinationClient
@@ -187,17 +190,10 @@ final class PairingManager: NSObject {
             state = .awaitingConfirmation
             logger.info("Pairing request sent for code \(payload.code)")
 
-            // In the real implementation, the Mac daemon confirms the pairing
-            // via the coordination server or direct connection.
-            // For now, we create the device directly from the QR payload.
-            let device = MacDevice(
-                hostname: "Mac",
-                deviceId: String(payload.identity.prefix(16)),
-                wgPublicKey: payload.wgPub,
-                identityPublicKey: payload.identity,
-                tunnelIP: tunnelIPFromWGKey(payload.wgPub),
-                isOnline: true,
-                lastSeen: Date()
+            // Poll for confirmation from the Mac
+            let device = try await pollForConfirmation(
+                code: payload.code,
+                coordinationClient: coordinationClient
             )
 
             state = .paired(device)
@@ -208,6 +204,39 @@ final class PairingManager: NSObject {
             logger.error("Pairing request failed: \(error)")
             state = .failed("Pairing failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Poll the coordination server for pairing confirmation.
+    /// Polls every 2 seconds for up to 60 seconds.
+    private func pollForConfirmation(
+        code: String,
+        coordinationClient: CoordinationClient
+    ) async throws -> MacDevice {
+        let maxAttempts = 30 // 30 * 2s = 60s
+        for attempt in 1...maxAttempts {
+            let confirmation = try await coordinationClient.checkPairingStatus(code: code)
+
+            if confirmation.status == "confirmed",
+               let hostname = confirmation.hostname,
+               let deviceId = confirmation.deviceId,
+               let wgPub = confirmation.wgPub,
+               let identity = confirmation.identity {
+                return MacDevice(
+                    hostname: hostname,
+                    deviceId: deviceId,
+                    wgPublicKey: wgPub,
+                    identityPublicKey: identity,
+                    tunnelIP: tunnelIPFromWGKey(wgPub),
+                    isOnline: true,
+                    lastSeen: Date()
+                )
+            }
+
+            logger.debug("Pairing poll attempt \(attempt)/\(maxAttempts): still pending")
+            try await Task.sleep(for: .seconds(2))
+        }
+
+        throw PairingError.timeout
     }
 
     /// Reset the pairing state.
@@ -227,6 +256,22 @@ final class PairingManager: NSObject {
         let hash = SHA256.hash(data: keyData)
         let bytes = Array(hash)
         return "100.100.\(bytes[0]).\(max(1, bytes[1]))"
+    }
+}
+
+// MARK: - PairingError
+
+enum PairingError: Error, LocalizedError {
+    case timeout
+    case invalidCode
+
+    var errorDescription: String? {
+        switch self {
+        case .timeout:
+            "Pairing timed out. Make sure the Mac is running 'canopyd pair' and try again."
+        case .invalidCode:
+            "Invalid pairing code. Please enter the 6-digit code shown on your Mac."
+        }
     }
 }
 

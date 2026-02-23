@@ -45,8 +45,9 @@ type Daemon struct {
 	pipelines  map[string]*parser.Pipeline
 
 	// Per-session Unix socket connections (for writing remote input back to PTY).
-	connMu sync.Mutex
-	conns  map[string]net.Conn
+	connMu    sync.Mutex
+	conns     map[string]net.Conn
+	shellPIDs map[string]int // sessionID -> shell PID for signal forwarding
 }
 
 // New creates a new Daemon instance.
@@ -57,6 +58,7 @@ func New(cfg *config.Config, logger *zap.Logger) *Daemon {
 		registry:  session.NewRegistry(),
 		pipelines: make(map[string]*parser.Pipeline),
 		conns:     make(map[string]net.Conn),
+		shellPIDs: make(map[string]int),
 	}
 }
 
@@ -184,6 +186,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	apiAddr := wgEP.APIListenAddr(d.cfg.ListenPort)
 	d.apiSrv = api.New(apiAddr, d.registry, d.store, d.cfg, d.logger)
 	d.apiSrv.WriteToSession = d.writeToSession
+	d.apiSrv.SignalSession = d.signalSession
 
 	go func() {
 		if err := d.apiSrv.Start(ctx); err != nil {
@@ -263,6 +266,29 @@ func (d *Daemon) writeToSession(sessionID string, data []byte) error {
 	return protocol.WriteFrame(conn, frame)
 }
 
+// signalSession sends a signal to the process group of a session's shell.
+// This is the callback used by the API server for remote signal forwarding from iOS.
+func (d *Daemon) signalSession(sessionID string, sig syscall.Signal) error {
+	d.connMu.Lock()
+	pid := d.shellPIDs[sessionID]
+	d.connMu.Unlock()
+
+	if pid == 0 {
+		return fmt.Errorf("session %s has no tracked PID", sessionID)
+	}
+
+	// Send to the process group (negative PID).
+	if err := syscall.Kill(-pid, sig); err != nil {
+		return fmt.Errorf("kill process group %d: %w", pid, err)
+	}
+	d.logger.Info("signal sent to session",
+		zap.String("session_id", sessionID),
+		zap.Int("pid", pid),
+		zap.String("signal", sig.String()),
+	)
+	return nil
+}
+
 func (d *Daemon) handleConnection(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
@@ -277,6 +303,7 @@ func (d *Daemon) handleConnection(ctx context.Context, conn net.Conn) {
 		if sessionID != "" {
 			d.connMu.Lock()
 			delete(d.conns, sessionID)
+			delete(d.shellPIDs, sessionID)
 			d.connMu.Unlock()
 
 			d.closePipeline(sessionID)
@@ -376,9 +403,12 @@ func (d *Daemon) handleRegister(reg protocol.SessionRegister, conn net.Conn) (*s
 		d.logger.Error("create session on disk", zap.Error(err), zap.String("session_id", reg.SessionID))
 	}
 
-	// Track the connection for remote input write-back.
+	// Track the connection for remote input write-back and the shell PID for signal forwarding.
 	d.connMu.Lock()
 	d.conns[reg.SessionID] = conn
+	if reg.ShellPID > 0 {
+		d.shellPIDs[reg.SessionID] = reg.ShellPID
+	}
 	d.connMu.Unlock()
 
 	// Create a parser pipeline for this session.

@@ -127,6 +127,51 @@ actor CoordinationClient {
         logger.info("Pairing registered with coord server")
     }
 
+    // MARK: - Pairing Status
+
+    /// Poll the coordination server for the status of a pairing session by 6-digit code.
+    /// Returns the pairing confirmation with Mac device info when confirmed.
+    func checkPairingStatus(code: String) async throws -> PairingConfirmation {
+        let url = coordURL.appendingPathComponent("v1/pairing/\(code)/status")
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+
+        let (data, response) = try await session.data(for: request)
+        try validateResponse(response)
+
+        return try decoder.decode(PairingConfirmation.self, from: data)
+    }
+
+    // MARK: - TURN
+
+    /// Request a TURN relay allocation for a peer.
+    /// Returns the relay endpoint that both sides can use to relay WireGuard traffic.
+    func requestTURNAllocation(peerWGKey: String) async throws -> TURNAllocationResponse {
+        let body = TURNAllocationRequest(
+            deviceKey: devicePublicKey,
+            peerWgKey: peerWGKey,
+            sig: ""
+        )
+
+        let data = try encoder.encode(body)
+        let signature = try sign(data)
+
+        var signed = try decoder.decode(TURNAllocationRequest.self, from: data)
+        signed.sig = signature
+        let signedData = try encoder.encode(signed)
+
+        let url = coordURL.appendingPathComponent("v1/turn/allocate")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = signedData
+
+        let (responseData, response) = try await session.data(for: request)
+        try validateResponse(response)
+
+        return try decoder.decode(TURNAllocationResponse.self, from: responseData)
+    }
+
     // MARK: - STUN
 
     /// Discover our own public endpoint via the coordination server's STUN endpoint.
@@ -215,6 +260,46 @@ private struct CheckInRequest: Codable {
         case pairedDevices = "paired_devices"
         case apnsTokens = "apns_tokens"
         case timestamp, sig
+    }
+}
+
+struct TURNAllocationResponse: Codable, Sendable {
+    let relayEndpoint: Endpoint
+    let token: String
+    let expiresAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case relayEndpoint = "relay_endpoint"
+        case token
+        case expiresAt = "expires_at"
+    }
+}
+
+private struct TURNAllocationRequest: Codable {
+    let deviceKey: String
+    let peerWgKey: String
+    var sig: String
+
+    enum CodingKeys: String, CodingKey {
+        case deviceKey = "device_key"
+        case peerWgKey = "peer_wg_key"
+        case sig
+    }
+}
+
+/// Response from the coordination server's pairing status endpoint.
+struct PairingConfirmation: Codable, Sendable {
+    let status: String
+    let hostname: String?
+    let deviceId: String?
+    let wgPub: String?
+    let identity: String?
+
+    enum CodingKeys: String, CodingKey {
+        case status, hostname
+        case deviceId = "device_id"
+        case wgPub = "wg_pub"
+        case identity
     }
 }
 

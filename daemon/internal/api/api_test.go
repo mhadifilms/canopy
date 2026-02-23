@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
+	"syscall"
 	"testing"
 	"time"
 
@@ -264,5 +266,163 @@ func TestClientCount(t *testing.T) {
 
 	if srv.ClientCount() != 0 {
 		t.Errorf("after disconnect: got %d", srv.ClientCount())
+	}
+}
+
+func TestSignalSuccess(t *testing.T) {
+	srv, httpSrv := setupTestServer(t)
+
+	meta := &session.Meta{
+		SessionID: "signal-session",
+		Status:    session.StatusActive,
+		StartedAt: time.Now(),
+	}
+	srv.registry.Register(session.NewSession(meta))
+
+	// Wire up a mock signal callback that records what was called.
+	var gotSessionID string
+	var gotSignal syscall.Signal
+	srv.SignalSession = func(sessionID string, sig syscall.Signal) error {
+		gotSessionID = sessionID
+		gotSignal = sig
+		return nil
+	}
+
+	conn, ctx := connectWS(t, httpSrv)
+
+	if err := wsjson.Write(ctx, conn, IncomingMessage{
+		Type:      "signal",
+		SessionID: "signal-session",
+		Signal:    "SIGINT",
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var resp OutgoingMessage
+	if err := wsjson.Read(ctx, conn, &resp); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if resp.Type != "signal_sent" {
+		t.Errorf("expected signal_sent, got %q (code=%q, msg=%q)", resp.Type, resp.Code, resp.Message)
+	}
+	if resp.SessionID != "signal-session" {
+		t.Errorf("session_id: got %q", resp.SessionID)
+	}
+	if gotSessionID != "signal-session" {
+		t.Errorf("callback session_id: got %q", gotSessionID)
+	}
+	if gotSignal != syscall.SIGINT {
+		t.Errorf("callback signal: got %v, want SIGINT", gotSignal)
+	}
+}
+
+func TestSignalUnknown(t *testing.T) {
+	srv, httpSrv := setupTestServer(t)
+
+	srv.SignalSession = func(sessionID string, sig syscall.Signal) error {
+		return nil
+	}
+
+	conn, ctx := connectWS(t, httpSrv)
+
+	if err := wsjson.Write(ctx, conn, IncomingMessage{
+		Type:      "signal",
+		SessionID: "any",
+		Signal:    "SIGFOO",
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var resp OutgoingMessage
+	if err := wsjson.Read(ctx, conn, &resp); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if resp.Type != "error" {
+		t.Errorf("expected error, got %q", resp.Type)
+	}
+	if resp.Code != "unknown_signal" {
+		t.Errorf("code: got %q", resp.Code)
+	}
+}
+
+func TestSignalMissingFields(t *testing.T) {
+	srv, httpSrv := setupTestServer(t)
+
+	srv.SignalSession = func(sessionID string, sig syscall.Signal) error {
+		return nil
+	}
+
+	conn, ctx := connectWS(t, httpSrv)
+
+	// Missing session_id and signal.
+	if err := wsjson.Write(ctx, conn, IncomingMessage{
+		Type: "signal",
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var resp OutgoingMessage
+	if err := wsjson.Read(ctx, conn, &resp); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if resp.Type != "error" {
+		t.Errorf("expected error, got %q", resp.Type)
+	}
+	if resp.Code != "invalid_signal" {
+		t.Errorf("code: got %q", resp.Code)
+	}
+}
+
+func TestSignalCallbackError(t *testing.T) {
+	srv, httpSrv := setupTestServer(t)
+
+	srv.SignalSession = func(sessionID string, sig syscall.Signal) error {
+		return fmt.Errorf("process not found")
+	}
+
+	conn, ctx := connectWS(t, httpSrv)
+
+	if err := wsjson.Write(ctx, conn, IncomingMessage{
+		Type:      "signal",
+		SessionID: "any",
+		Signal:    "SIGTERM",
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var resp OutgoingMessage
+	if err := wsjson.Read(ctx, conn, &resp); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if resp.Type != "error" {
+		t.Errorf("expected error, got %q", resp.Type)
+	}
+	if resp.Code != "signal_error" {
+		t.Errorf("code: got %q", resp.Code)
+	}
+}
+
+func TestSignalNotSupported(t *testing.T) {
+	_, httpSrv := setupTestServer(t)
+	conn, ctx := connectWS(t, httpSrv)
+
+	// SignalSession is nil (not wired up).
+	if err := wsjson.Write(ctx, conn, IncomingMessage{
+		Type:      "signal",
+		SessionID: "any",
+		Signal:    "SIGINT",
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var resp OutgoingMessage
+	if err := wsjson.Read(ctx, conn, &resp); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if resp.Type != "error" {
+		t.Errorf("expected error, got %q", resp.Type)
+	}
+	if resp.Code != "not_supported" {
+		t.Errorf("code: got %q", resp.Code)
 	}
 }

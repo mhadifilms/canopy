@@ -1,36 +1,50 @@
 // Package api implements the coordination server HTTP API.
-// Endpoints: /v1/checkin, /v1/endpoints, /v1/register_pairing, /v1/push
+// Endpoints: /v1/checkin, /v1/endpoints, /v1/register_pairing, /v1/push, /v1/pairing
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"go.uber.org/zap"
 
+	"github.com/canopy-dev/coord/internal/apns"
 	"github.com/canopy-dev/coord/internal/auth"
 	"github.com/canopy-dev/coord/internal/ratelimit"
 	"github.com/canopy-dev/coord/internal/store"
 )
 
+var pairingCodeRe = regexp.MustCompile(`^/v1/pairing/([0-9]{6})/status$`)
+
 // Server is the coordination API server.
 type Server struct {
-	store         *store.Store
-	logger        *zap.Logger
+	store          *store.Store
+	logger         *zap.Logger
 	checkinLimiter *ratelimit.Limiter // 100 check-ins/min per device
-	pushLimiter   *ratelimit.Limiter  // 30 pushes/min per device
-	mux           *http.ServeMux
+	pushLimiter    *ratelimit.Limiter // 30 pushes/min per device
+	apnsClient     *apns.Client
+	mux            *http.ServeMux
 }
 
 // New creates a new API server.
 func New(s *store.Store, logger *zap.Logger) *Server {
+	apnsClient := apns.NewClient()
+	if apnsClient != nil {
+		logger.Info("APNs client initialized, push notifications will be forwarded")
+	} else {
+		logger.Info("APNs client not configured, push notifications will be logged only")
+	}
+
 	srv := &Server{
 		store:          s,
 		logger:         logger,
 		checkinLimiter: ratelimit.New(100.0/60.0, 10), // ~1.67/s, burst 10
 		pushLimiter:    ratelimit.New(30.0/60.0, 5),    // 0.5/s, burst 5
+		apnsClient:     apnsClient,
 		mux:            http.NewServeMux(),
 	}
 
@@ -38,6 +52,9 @@ func New(s *store.Store, logger *zap.Logger) *Server {
 	srv.mux.HandleFunc("GET /v1/endpoints", srv.handleEndpoints)
 	srv.mux.HandleFunc("POST /v1/register_pairing", srv.handleRegisterPairing)
 	srv.mux.HandleFunc("POST /v1/push", srv.handlePush)
+	srv.mux.HandleFunc("POST /v1/pairing/initiate", srv.handlePairingInitiate)
+	srv.mux.HandleFunc("POST /v1/pairing/confirm", srv.handlePairingConfirm)
+	srv.mux.HandleFunc("GET /v1/pairing/", srv.handlePairingStatus)
 	srv.mux.HandleFunc("GET /healthz", srv.handleHealth)
 
 	return srv
@@ -101,6 +118,35 @@ type PushRequest struct {
 	DeviceKey string       `json:"device_key"`
 	Sig       string       `json:"sig"`
 	Targets   []PushTarget `json:"targets"`
+}
+
+// PairingInitiateRequest is sent by the Mac daemon when starting `canopyd pair`.
+type PairingInitiateRequest struct {
+	Code     string `json:"code"`
+	Hostname string `json:"hostname"`
+	DeviceID string `json:"device_id"`
+	WGPub    string `json:"wg_pub"`
+	Identity string `json:"identity"`
+	Sig      string `json:"sig"`
+}
+
+// PairingConfirmRequest is sent by the Mac daemon to confirm a pairing.
+type PairingConfirmRequest struct {
+	Code     string `json:"code"`
+	Hostname string `json:"hostname"`
+	DeviceID string `json:"device_id"`
+	WGPub    string `json:"wg_pub"`
+	Identity string `json:"identity"`
+	Sig      string `json:"sig"`
+}
+
+// PairingStatusResponse is returned when polling for pairing status.
+type PairingStatusResponse struct {
+	Status   string `json:"status"`
+	Hostname string `json:"hostname,omitempty"`
+	DeviceID string `json:"device_id,omitempty"`
+	WGPub    string `json:"wg_pub,omitempty"`
+	Identity string `json:"identity,omitempty"`
 }
 
 // ErrorResponse is returned on errors.
@@ -254,19 +300,31 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// In MVP, we log the push request. Real implementation would forward to APNs.
 	deviceID, _ := auth.DeviceIDFromPublicKey(req.DeviceKey)
 	s.logger.Info("push notification request",
 		zap.String("device_id", deviceID),
 		zap.Int("targets", len(req.Targets)),
 	)
 
-	// For each target, log the notification.
 	sent := 0
+	failed := 0
 	for _, target := range req.Targets {
 		if target.APNSToken == "" {
 			continue
 		}
+
+		if s.apnsClient != nil {
+			payload := notificationToPayload(target.Notification)
+			if err := s.apnsClient.Send(context.Background(), target.APNSToken, payload); err != nil {
+				s.logger.Warn("APNs push failed",
+					zap.String("apns_token", target.APNSToken[:8]+"..."),
+					zap.Error(err),
+				)
+				failed++
+				continue
+			}
+		}
+
 		s.logger.Info("push forwarded",
 			zap.String("apns_token", target.APNSToken[:8]+"..."),
 			zap.String("title", target.Notification.Title),
@@ -275,9 +333,99 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok":   true,
-		"sent": sent,
+		"ok":     true,
+		"sent":   sent,
+		"failed": failed,
 	})
+}
+
+func (s *Server) handlePairingInitiate(w http.ResponseWriter, r *http.Request) {
+	var req PairingInitiateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+
+	if req.Code == "" || req.Identity == "" {
+		s.writeError(w, http.StatusBadRequest, "missing_fields", "code and identity required")
+		return
+	}
+
+	// Verify signature over identity + code.
+	signedMessage := req.Identity + req.Code
+	if err := auth.VerifySignature(req.Identity, req.Sig, []byte(signedMessage)); err != nil {
+		s.writeError(w, http.StatusUnauthorized, "invalid_signature", err.Error())
+		return
+	}
+
+	// Create the pairing session as pending first, then confirm it with the Mac's info.
+	s.store.CreatePairingSession(req.Code)
+	s.store.ConfirmPairingSession(req.Code, req.Hostname, req.DeviceID, req.WGPub, req.Identity)
+
+	s.logger.Info("pairing initiated",
+		zap.String("code", req.Code),
+		zap.String("hostname", req.Hostname),
+	)
+
+	s.writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handlePairingConfirm(w http.ResponseWriter, r *http.Request) {
+	var req PairingConfirmRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+
+	if req.Code == "" || req.Identity == "" {
+		s.writeError(w, http.StatusBadRequest, "missing_fields", "code and identity required")
+		return
+	}
+
+	// Verify signature over identity + code.
+	signedMessage := req.Identity + req.Code
+	if err := auth.VerifySignature(req.Identity, req.Sig, []byte(signedMessage)); err != nil {
+		s.writeError(w, http.StatusUnauthorized, "invalid_signature", err.Error())
+		return
+	}
+
+	ok := s.store.ConfirmPairingSession(req.Code, req.Hostname, req.DeviceID, req.WGPub, req.Identity)
+	if !ok {
+		s.writeError(w, http.StatusNotFound, "not_found", "pairing session not found or expired")
+		return
+	}
+
+	s.logger.Info("pairing confirmed",
+		zap.String("code", req.Code),
+		zap.String("hostname", req.Hostname),
+	)
+
+	s.writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handlePairingStatus(w http.ResponseWriter, r *http.Request) {
+	matches := pairingCodeRe.FindStringSubmatch(r.URL.Path)
+	if matches == nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_path", "expected /v1/pairing/{6-digit-code}/status")
+		return
+	}
+	code := matches[1]
+
+	sess := s.store.GetPairingSession(code)
+	if sess == nil {
+		s.writeJSON(w, http.StatusOK, PairingStatusResponse{Status: "pending"})
+		return
+	}
+
+	resp := PairingStatusResponse{Status: sess.Status}
+	if sess.Status == "confirmed" {
+		resp.Hostname = sess.Hostname
+		resp.DeviceID = sess.DeviceID
+		resp.WGPub = sess.WGPub
+		resp.Identity = sess.Identity
+	}
+
+	s.writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -288,6 +436,26 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 // --- Helpers ---
+
+func notificationToPayload(n Notification) *apns.Payload {
+	p := &apns.Payload{
+		Alert: apns.Alert{
+			Title:    n.Title,
+			Subtitle: n.Subtitle,
+			Body:     n.Body,
+		},
+		Sound:    "default",
+		Category: n.Category,
+		ThreadID: n.ThreadID,
+	}
+	if len(n.Data) > 0 {
+		p.Data = make(map[string]any, len(n.Data))
+		for k, v := range n.Data {
+			p.Data[k] = v
+		}
+	}
+	return p
+}
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")

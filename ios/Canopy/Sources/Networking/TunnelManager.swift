@@ -43,6 +43,7 @@ final class TunnelManager {
     private(set) var tunnelActive: Bool = false
 
     private let coordinationClient: CoordinationClient
+    private let tunnelProvider: WireGuardTunnelProvider
     private var pathMonitor: NWPathMonitor?
     private var monitorQueue: DispatchQueue?
     private var connectionTasks: [String: Task<Void, Never>] = [:]
@@ -54,11 +55,15 @@ final class TunnelManager {
     /// Time to wait for a direct WireGuard handshake before falling back to TURN.
     private static let directHandshakeTimeout: TimeInterval = 5.0
 
+    /// Timeout for TURN relay connection attempts.
+    private static let turnTimeout: TimeInterval = 10.0
+
     /// Interval between check-ins with the coordination server.
     private static let checkInInterval: TimeInterval = 30.0
 
-    init(coordinationClient: CoordinationClient) {
+    init(coordinationClient: CoordinationClient, tunnelProvider: WireGuardTunnelProvider = SimulatorWireGuardProvider()) {
         self.coordinationClient = coordinationClient
+        self.tunnelProvider = tunnelProvider
     }
 
     // MARK: - Public API
@@ -101,9 +106,12 @@ final class TunnelManager {
         connectionTasks.removeValue(forKey: wgPublicKey)
         peerStates.removeValue(forKey: wgPublicKey)
         peerEndpoints.removeValue(forKey: wgPublicKey)
+
+        Task {
+            try? await tunnelProvider.removePeer(publicKey: wgPublicKey)
+        }
+
         logger.info("Removed peer \(wgPublicKey.prefix(8))")
-        // In real implementation: update the NETunnelProviderManager config
-        // to remove this peer from the WireGuard interface.
     }
 
     /// Initiate the connection flow to a specific Mac peer.
@@ -256,6 +264,7 @@ final class TunnelManager {
             // 3. Wait for a successful handshake (via WireGuard stats)
             let success = await waitForHandshake(
                 endpoint: endpoint,
+                peerWGKey: peerWGKey,
                 timeout: Self.directHandshakeTimeout
             )
 
@@ -269,7 +278,7 @@ final class TunnelManager {
     }
 
     /// Wait for a WireGuard handshake to succeed with a timeout.
-    private func waitForHandshake(endpoint: Endpoint, timeout: TimeInterval) async -> Bool {
+    private func waitForHandshake(endpoint: Endpoint, peerWGKey: String, timeout: TimeInterval) async -> Bool {
         let deadline = ContinuousClock.now + .seconds(timeout)
 
         while ContinuousClock.now < deadline {
@@ -278,9 +287,7 @@ final class TunnelManager {
             // Poll interval: check every 500ms
             try? await Task.sleep(for: .milliseconds(500))
 
-            // Placeholder: in real implementation, check WireGuard handshake status
-            // via NETunnelProviderSession.sendProviderMessage
-            let handshakeComplete = await checkHandshakeStatus(endpoint: endpoint)
+            let handshakeComplete = await checkHandshakeStatus(endpoint: endpoint, peerWGKey: peerWGKey)
             if handshakeComplete {
                 return true
             }
@@ -290,17 +297,66 @@ final class TunnelManager {
     }
 
     /// Check if a WireGuard handshake has completed with the given endpoint.
-    private func checkHandshakeStatus(endpoint: Endpoint) async -> Bool {
-        // Placeholder: will be implemented with Network Extension IPC
-        return false
+    private func checkHandshakeStatus(endpoint: Endpoint, peerWGKey: String) async -> Bool {
+        // Configure the peer in the tunnel provider so it knows the endpoint
+        let endpointString = "\(endpoint.ip):\(endpoint.port)"
+        do {
+            try await tunnelProvider.configurePeer(
+                publicKey: peerWGKey,
+                endpoint: endpointString,
+                allowedIP: "100.100.0.0/32"
+            )
+        } catch {
+            logger.warning("Failed to configure peer \(peerWGKey.prefix(8)): \(error)")
+            return false
+        }
+
+        return await tunnelProvider.checkHandshake(publicKey: peerWGKey)
     }
 
     /// Attempt a TURN-relayed connection through the coordination server.
     private func attemptTURNConnection(peerWGKey: String) async -> Bool {
-        // Placeholder: TURN protocol integration will be added
-        // when the coordination server's TURN support is ready
-        logger.info("TURN relay attempt for peer \(peerWGKey.prefix(8)) (pending coord server TURN support)")
-        return false
+        logger.info("Requesting TURN allocation for peer \(peerWGKey.prefix(8))")
+
+        // Step 1: Request TURN allocation from coordination server
+        let allocation: TURNAllocationResponse
+        do {
+            allocation = try await coordinationClient.requestTURNAllocation(peerWGKey: peerWGKey)
+            logger.info("TURN allocation received: \(allocation.relayEndpoint.ip):\(allocation.relayEndpoint.port)")
+        } catch {
+            logger.error("TURN allocation failed for \(peerWGKey.prefix(8)): \(error)")
+            return false
+        }
+
+        guard !Task.isCancelled else { return false }
+
+        // Step 2: Configure WireGuard peer with the relay endpoint
+        let relayEndpoint = "\(allocation.relayEndpoint.ip):\(allocation.relayEndpoint.port)"
+        do {
+            try await tunnelProvider.configurePeer(
+                publicKey: peerWGKey,
+                endpoint: relayEndpoint,
+                allowedIP: "100.100.0.0/32"
+            )
+        } catch {
+            logger.error("Failed to configure relay peer \(peerWGKey.prefix(8)): \(error)")
+            return false
+        }
+
+        guard !Task.isCancelled else { return false }
+
+        // Step 3: Check handshake through the relay with timeout
+        let success = await waitForHandshake(
+            endpoint: allocation.relayEndpoint,
+            peerWGKey: peerWGKey,
+            timeout: Self.turnTimeout
+        )
+
+        if success {
+            peerEndpoints[peerWGKey] = allocation.relayEndpoint
+        }
+
+        return success
     }
 
     // MARK: - Network Monitoring

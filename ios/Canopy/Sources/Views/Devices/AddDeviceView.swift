@@ -1,4 +1,5 @@
 import SwiftUI
+import CryptoKit
 
 /// QR scanner + manual code entry for pairing a new Mac.
 struct AddDeviceView: View {
@@ -72,12 +73,68 @@ struct AddDeviceView: View {
         isPairing = true
         errorMessage = nil
 
-        // Placeholder: real pairing involves exchanging WireGuard keys
-        // via the coordination server using the 6-digit code.
-        // For now, just show the flow.
-        try? await Task.sleep(for: .seconds(2))
+        do {
+            let code = manualCode.trimmingCharacters(in: .whitespaces)
+            guard code.count == 6, code.allSatisfy(\.isNumber) else {
+                throw PairingError.invalidCode
+            }
 
-        isPairing = false
-        errorMessage = "Pairing not yet implemented in this build"
+            // Create a temporary CoordinationClient to poll for pairing status.
+            // The coord URL defaults to the production server; the identity key
+            // is ephemeral for this polling-only flow.
+            let identityKey = Curve25519.Signing.PrivateKey()
+            let wgPublicKey = identityKey.publicKey.rawRepresentation.base64EncodedString()
+            let coordURL = URL(string: "https://coord.canopy.dev")!
+            let client = CoordinationClient(
+                coordURL: coordURL,
+                identityKey: identityKey,
+                wgPublicKey: wgPublicKey
+            )
+
+            // Poll the coordination server for the Mac's confirmation.
+            let maxAttempts = 30 // 30 * 2s = 60s timeout
+            for attempt in 1...maxAttempts {
+                let confirmation = try await client.checkPairingStatus(code: code)
+
+                if confirmation.status == "confirmed",
+                   let hostname = confirmation.hostname,
+                   let deviceId = confirmation.deviceId,
+                   let wgPub = confirmation.wgPub,
+                   let identity = confirmation.identity {
+                    let device = MacDevice(
+                        hostname: hostname,
+                        deviceId: deviceId,
+                        wgPublicKey: wgPub,
+                        identityPublicKey: identity,
+                        tunnelIP: tunnelIPFromWGKey(wgPub),
+                        isOnline: true,
+                        lastSeen: Date()
+                    )
+                    appState.addPairedDevice(device)
+                    isPairing = false
+                    dismiss()
+                    return
+                }
+
+                if attempt < maxAttempts {
+                    try await Task.sleep(for: .seconds(2))
+                }
+            }
+
+            throw PairingError.timeout
+        } catch {
+            isPairing = false
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Derive a tunnel IP from a WireGuard public key (deterministic).
+    private func tunnelIPFromWGKey(_ wgKey: String) -> String {
+        guard let keyData = Data(base64Encoded: wgKey) else {
+            return "100.100.0.1"
+        }
+        let hash = SHA256.hash(data: keyData)
+        let bytes = Array(hash)
+        return "100.100.\(bytes[0]).\(max(1, bytes[1]))"
     }
 }
