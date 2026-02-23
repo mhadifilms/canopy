@@ -42,7 +42,7 @@ struct AIApprovalBanner: View {
                         Image(systemName: showDiff ? "chevron.up" : "chevron.down")
                             .font(.caption2)
                     }
-                    .foregroundStyle(.accentColor)
+                    .foregroundStyle(Color.accentColor)
                 }
                 .frame(minHeight: 44)
                 .accessibilityLabel(showDiff ? "Hide code diff" : "Show code diff")

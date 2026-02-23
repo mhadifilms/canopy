@@ -167,7 +167,7 @@ final class PairingManager: NSObject {
     // MARK: - QR Parsing
 
     /// Parse a QR code string into a pairing payload (convenience wrapper).
-    static func parseQRPayload(_ string: String) -> PairingQRPayload? {
+    nonisolated static func parseQRPayload(_ string: String) -> PairingQRPayload? {
         parsePairingQRPayload(string)
     }
 

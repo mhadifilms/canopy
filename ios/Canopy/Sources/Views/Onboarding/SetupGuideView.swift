@@ -24,7 +24,7 @@ struct SetupGuideView: View {
 
             Image(systemName: "terminal")
                 .font(.system(size: 48))
-                .foregroundStyle(.accentColor)
+                .foregroundStyle(Color.accentColor)
 
             Text("Install on your Mac")
                 .font(.title2.weight(.bold))
@@ -64,7 +64,7 @@ struct SetupGuideView: View {
 
             Image(systemName: "qrcode.viewfinder")
                 .font(.system(size: 48))
-                .foregroundStyle(.accentColor)
+                .foregroundStyle(Color.accentColor)
 
             Text("Pair your Mac")
                 .font(.title2.weight(.bold))

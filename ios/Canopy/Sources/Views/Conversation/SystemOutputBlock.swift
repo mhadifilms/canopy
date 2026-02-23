@@ -52,7 +52,7 @@ struct SystemOutputBlock: View {
                     } label: {
                         Text("\(lines.count - Self.collapsedLineLimit) more lines...")
                             .font(.caption2)
-                            .foregroundStyle(.accentColor)
+                            .foregroundStyle(Color.accentColor)
                     }
                     .accessibilityLabel("Expand \(lines.count) total lines of output")
                 }

@@ -45,7 +45,7 @@ struct InputBar: View {
             } label: {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.title2)
-                    .foregroundStyle(text.isEmpty ? .secondary : .accentColor)
+                    .foregroundStyle(text.isEmpty ? Color.secondary : Color.accentColor)
             }
             .disabled(text.isEmpty)
             .frame(minWidth: 44, minHeight: 44)

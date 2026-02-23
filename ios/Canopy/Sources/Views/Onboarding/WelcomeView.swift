@@ -11,7 +11,7 @@ struct WelcomeView: View {
 
                 Image(systemName: "desktopcomputer.and.arrow.down")
                     .font(.system(size: 60))
-                    .foregroundStyle(.accentColor)
+                    .foregroundStyle(Color.accentColor)
 
                 VStack(spacing: 8) {
                     Text("Welcome to Canopy")
@@ -63,7 +63,7 @@ struct WelcomeView: View {
         HStack(spacing: 16) {
             Image(systemName: icon)
                 .font(.title2)
-                .foregroundStyle(.accentColor)
+                .foregroundStyle(Color.accentColor)
                 .frame(width: 36)
 
             VStack(alignment: .leading, spacing: 2) {

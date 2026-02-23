@@ -93,7 +93,7 @@ struct AIActionCard: View {
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
-                        .foregroundStyle(.accentColor)
+                        .foregroundStyle(Color.accentColor)
                     }
                     .frame(minHeight: 44)
                     .accessibilityLabel("Open file: \(path)")
