@@ -108,15 +108,13 @@ struct AIApprovalBanner: View {
 
     private func triggerImpactHaptic() {
         #if os(iOS)
-        let generator = UIImpactFeedbackGenerator(style: .medium)
-        generator.impactOccurred()
+        HapticService.medium()
         #endif
     }
 
     private func triggerNotificationHaptic() {
         #if os(iOS)
-        let generator = UINotificationFeedbackGenerator()
-        generator.notificationOccurred(.warning)
+        HapticService.warning()
         #endif
     }
 }

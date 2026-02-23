@@ -166,6 +166,65 @@ func TestRegistryConcurrency(t *testing.T) {
 	}
 }
 
+func TestBroadcastExcept(t *testing.T) {
+	sess := NewSession(&Meta{SessionID: "except-test"})
+
+	sub1 := sess.Subscribe("sender")
+	sub2 := sess.Subscribe("receiver")
+
+	event := parser.Event{
+		Type:      parser.EventRemoteInput,
+		Timestamp: time.Now(),
+		Content:   "remote keystroke",
+	}
+	sess.BroadcastExcept(event, "sender")
+
+	// sub1 (excluded) should NOT receive the event.
+	select {
+	case <-sub1.Events:
+		t.Error("excluded subscriber should not receive the event")
+	case <-time.After(50 * time.Millisecond):
+		// Good — no event received.
+	}
+
+	// sub2 should receive the event.
+	select {
+	case got := <-sub2.Events:
+		if got.Content != "remote keystroke" {
+			t.Errorf("receiver content: got %q", got.Content)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("receiver timed out")
+	}
+}
+
+func TestSubscriberCount(t *testing.T) {
+	sess := NewSession(&Meta{SessionID: "count-test"})
+
+	if sess.SubscriberCount() != 0 {
+		t.Fatalf("initial count: got %d, want 0", sess.SubscriberCount())
+	}
+
+	sess.Subscribe("a")
+	sess.Subscribe("b")
+	sess.Subscribe("c")
+
+	if sess.SubscriberCount() != 3 {
+		t.Fatalf("after 3 subscribes: got %d, want 3", sess.SubscriberCount())
+	}
+
+	sess.Unsubscribe("b")
+	if sess.SubscriberCount() != 2 {
+		t.Fatalf("after unsubscribe: got %d, want 2", sess.SubscriberCount())
+	}
+
+	sess.Unsubscribe("a")
+	sess.Unsubscribe("c")
+	if sess.SubscriberCount() != 0 {
+		t.Fatalf("after all unsubscribes: got %d, want 0", sess.SubscriberCount())
+	}
+}
+
 func TestBroadcastNonBlocking(t *testing.T) {
 	sess := NewSession(&Meta{SessionID: "nonblock"})
 	sub := sess.Subscribe("slow")

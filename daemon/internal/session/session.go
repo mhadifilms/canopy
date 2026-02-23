@@ -112,6 +112,22 @@ func (s *Session) Broadcast(event parser.Event) {
 	}
 }
 
+// BroadcastExcept sends an event to all subscribers except the one with excludeID.
+// Used for remote_input events so the sender doesn't receive their own input back.
+func (s *Session) BroadcastExcept(event parser.Event, excludeID string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, sub := range s.subscribers {
+		if sub.ID == excludeID {
+			continue
+		}
+		select {
+		case sub.Events <- event:
+		default:
+		}
+	}
+}
+
 // SubscriberCount returns the number of active subscribers.
 func (s *Session) SubscriberCount() int {
 	s.mu.RLock()

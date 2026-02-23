@@ -60,6 +60,11 @@ final class SessionStore {
         needsAttention.count
     }
 
+    /// Number of live (non-ended) sessions for a specific device.
+    func sessionCount(for deviceId: String) -> Int {
+        sessions.values.filter { $0.macDeviceId == deviceId && $0.status != .ended }.count
+    }
+
     // MARK: - Message handlers
 
     /// Replace the session list for a specific device.

@@ -1,6 +1,9 @@
 import SwiftUI
 
 /// Detail view for a single paired Mac.
+///
+/// Shows connection status, session count, tunnel IP, device info,
+/// and actions to reconnect or remove.
 struct DeviceDetailView: View {
     let device: MacDevice
     let appState: AppState
@@ -10,6 +13,14 @@ struct DeviceDetailView: View {
 
     private var connectionState: ConnectionState {
         appState.connectionManager.connectionStates[device.deviceId] ?? .disconnected
+    }
+
+    private var sessionCount: Int {
+        appState.sessionStore.sessionCount(for: device.deviceId)
+    }
+
+    private var lastHeard: Date? {
+        appState.connectionManager.lastHeardFrom[device.deviceId] ?? device.lastSeen
     }
 
     var body: some View {
@@ -35,7 +46,29 @@ struct DeviceDetailView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                if connectionState != .connected {
+                HStack {
+                    Text("Active Sessions")
+                    Spacer()
+                    Text("\(sessionCount)")
+                        .foregroundStyle(.secondary)
+                }
+
+                if let lastHeard {
+                    HStack {
+                        Text("Last Heard")
+                        Spacer()
+                        Text(RelativeDateFormatter.string(for: lastHeard))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if connectionState == .connected {
+                    Button("Disconnect") {
+                        appState.connectionManager.connections[device.deviceId]?.disconnect()
+                    }
+                    .foregroundStyle(.orange)
+                    .accessibilityLabel("Disconnect from \(device.hostname)")
+                } else {
                     Button("Reconnect") {
                         appState.connectionManager.reconnect(device.deviceId)
                     }
@@ -59,7 +92,7 @@ struct DeviceDetailView: View {
                 }
                 if let lastSeen = device.lastSeen {
                     HStack {
-                        Text("Last seen")
+                        Text("Last Seen")
                         Spacer()
                         Text(RelativeDateFormatter.string(for: lastSeen))
                             .foregroundStyle(.secondary)

@@ -2,9 +2,11 @@ import SwiftUI
 
 /// A single row in the session list.
 ///
-/// Shows: status dot, process name, Mac hostname, relative time, preview text.
+/// Shows: status dot, process name, Mac hostname with device color,
+/// relative time, preview text.
 struct SessionRowView: View {
     let session: Session
+    var deviceColor: Color = .secondary
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -26,9 +28,16 @@ struct SessionRowView: View {
                     .foregroundStyle(.secondary)
                 }
 
-                Text(session.hostname)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Image(systemName: "desktopcomputer")
+                        .font(.caption2)
+                        .foregroundStyle(deviceColor)
+                    Text(session.hostname)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("on \(session.hostname)")
 
                 if let preview = session.preview {
                     Text(preview)
@@ -39,6 +48,7 @@ struct SessionRowView: View {
             }
         }
         .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder

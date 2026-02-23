@@ -3,16 +3,23 @@ import OSLog
 
 private let logger = Logger(subsystem: "dev.canopy.app", category: "ConnectionManager")
 
-/// Manages WebSocket connections to multiple Macs.
+/// Manages WebSocket connections to multiple Macs simultaneously.
 ///
 /// Owns one `CanopyConnection` per paired device. Routes incoming messages
-/// to the `MessageRouter` for dispatch to stores.
+/// to the `MessageRouter` for dispatch to stores. Integrates with
+/// `TunnelManager` for multi-peer WireGuard tunnel state.
 @MainActor
 @Observable
 final class ConnectionManager {
 
     private(set) var connections: [String: CanopyConnection] = [:]
     private(set) var connectionStates: [String: ConnectionState] = [:]
+
+    /// Session count per device, updated when session lists arrive.
+    private(set) var sessionCounts: [String: Int] = [:]
+
+    /// Last time we received data from each device.
+    private(set) var lastHeardFrom: [String: Date] = [:]
 
     private let router: MessageRouter
 
@@ -32,6 +39,16 @@ final class ConnectionManager {
         }
     }
 
+    /// Number of connected devices.
+    var connectedDeviceCount: Int {
+        connectedDeviceIds.count
+    }
+
+    /// Total number of managed devices (connected or not).
+    var totalDeviceCount: Int {
+        connections.count
+    }
+
     // MARK: - Lifecycle
 
     /// Add a Mac device and connect to it.
@@ -45,7 +62,15 @@ final class ConnectionManager {
 
         connection.onMessage = { [weak self] message in
             Task { @MainActor in
-                self?.router.route(message, from: device.deviceId)
+                guard let self else { return }
+                self.lastHeardFrom[device.deviceId] = Date()
+
+                // Track session counts from session_list responses
+                if case .sessionList(let payload) = message {
+                    self.sessionCounts[device.deviceId] = payload.sessions.count
+                }
+
+                self.router.route(message, from: device.deviceId)
             }
         }
 
@@ -53,11 +78,17 @@ final class ConnectionManager {
             Task { @MainActor in
                 self?.connectionStates[device.deviceId] = state
                 logger.info("Device \(device.hostname) state: \(String(describing: state))")
+
+                // Request sessions when we first connect
+                if case .connected = state {
+                    self?.lastHeardFrom[device.deviceId] = Date()
+                }
             }
         }
 
         connections[device.deviceId] = connection
         connectionStates[device.deviceId] = .disconnected
+        sessionCounts[device.deviceId] = 0
         connection.connect()
     }
 
@@ -66,6 +97,8 @@ final class ConnectionManager {
         connections[deviceId]?.disconnect()
         connections.removeValue(forKey: deviceId)
         connectionStates.removeValue(forKey: deviceId)
+        sessionCounts.removeValue(forKey: deviceId)
+        lastHeardFrom.removeValue(forKey: deviceId)
     }
 
     /// Reconnect a specific device.

@@ -2,13 +2,20 @@ import SwiftUI
 
 /// Full-text search across session history.
 ///
-/// Query is sent to the Mac daemon for server-side search.
+/// Query is sent to all connected Mac daemons for server-side search.
+/// Results arrive via the MessageRouter and are collected in AppState.
 struct HistorySearchView: View {
     let appState: AppState
 
     @State private var query = ""
-    @State private var results: [DaemonMessage.SearchResultsPayload.SearchResult] = []
-    @State private var isSearching = false
+
+    private var results: [DaemonMessage.SearchResultsPayload.SearchResult] {
+        appState.searchResults
+    }
+
+    private var isSearching: Bool {
+        appState.isSearching
+    }
 
     var body: some View {
         List {
@@ -36,17 +43,35 @@ struct HistorySearchView: View {
                 ForEach(results, id: \.sessionId) { result in
                     NavigationLink(value: result.sessionId) {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(result.title ?? "Session")
-                                .font(.body.weight(.medium))
+                            HStack {
+                                Text(result.title ?? "Session")
+                                    .font(.body.weight(.medium))
+
+                                Spacer()
+
+                                Text(result.startedAt.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
 
                             ForEach(result.matches.prefix(3), id: \.ts) { match in
-                                Text(match.snippet)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
+                                HStack(spacing: 4) {
+                                    Text(match.eventType)
+                                        .font(.system(.caption2, design: .monospaced))
+                                        .foregroundStyle(.tertiary)
+                                        .frame(width: 60, alignment: .leading)
+
+                                    Text(match.snippet)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
                             }
                         }
+                        .padding(.vertical, 2)
                     }
+                    .frame(minHeight: 44)
+                    .accessibilityLabel("\(result.title ?? "Session") with \(result.matches.count) matches")
                 }
             }
         }
@@ -60,10 +85,6 @@ struct HistorySearchView: View {
 
     private func performSearch() async {
         guard !query.isEmpty else { return }
-        isSearching = true
-        // In a real implementation, send search_sessions to connected Macs
-        // and collect results via the MessageRouter.
-        try? await Task.sleep(for: .seconds(1))
-        isSearching = false
+        await appState.searchSessions(query: query)
     }
 }

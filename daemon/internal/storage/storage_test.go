@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -201,6 +203,279 @@ func TestReadEventsMissingFile(t *testing.T) {
 	}
 	if events != nil {
 		t.Errorf("expected nil, got %d events", len(events))
+	}
+}
+
+func TestSearchSessions(t *testing.T) {
+	dir := t.TempDir()
+	store := New(dir)
+
+	now := time.Now().UTC()
+
+	// Create 3 sessions with events containing different text.
+	for i, text := range []string{"deploying the auth service", "fixing the database migration", "auth token refresh bug"} {
+		sid := fmt.Sprintf("search-%d", i)
+		store.CreateSession(&session.Meta{SessionID: sid, StartedAt: now, Status: session.StatusActive})
+		store.AppendEvent(sid, parser.Event{
+			Type: parser.EventSystemOutput, Timestamp: now, Content: text,
+		})
+	}
+
+	results, err := store.SearchSessions(SearchOptions{Query: "auth"})
+	if err != nil {
+		t.Fatalf("SearchSessions: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results for 'auth', got %d", len(results))
+	}
+	// Both matching sessions should have at least one match.
+	for _, r := range results {
+		if len(r.Matches) == 0 {
+			t.Errorf("session %s has 0 matches", r.SessionID)
+		}
+	}
+}
+
+func TestSearchSessionsDateFilter(t *testing.T) {
+	dir := t.TempDir()
+	store := New(dir)
+
+	jan := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+	feb := time.Date(2026, 2, 15, 12, 0, 0, 0, time.UTC)
+	mar := time.Date(2026, 3, 15, 12, 0, 0, 0, time.UTC)
+
+	store.CreateSession(&session.Meta{SessionID: "jan", StartedAt: jan, Status: session.StatusActive})
+	store.AppendEvent("jan", parser.Event{Type: parser.EventUserInput, Timestamp: jan, Text: "deploy service"})
+
+	store.CreateSession(&session.Meta{SessionID: "feb", StartedAt: feb, Status: session.StatusActive})
+	store.AppendEvent("feb", parser.Event{Type: parser.EventUserInput, Timestamp: feb, Text: "deploy service"})
+
+	store.CreateSession(&session.Meta{SessionID: "mar", StartedAt: mar, Status: session.StatusActive})
+	store.AppendEvent("mar", parser.Event{Type: parser.EventUserInput, Timestamp: mar, Text: "deploy service"})
+
+	from := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 2, 28, 23, 59, 59, 0, time.UTC)
+
+	results, err := store.SearchSessions(SearchOptions{
+		Query: "deploy",
+		From:  &from,
+		To:    &to,
+	})
+	if err != nil {
+		t.Fatalf("SearchSessions: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result in Feb range, got %d", len(results))
+	}
+	if results[0].SessionID != "feb" {
+		t.Errorf("expected session 'feb', got %q", results[0].SessionID)
+	}
+}
+
+func TestSearchSessionsEmptyQuery(t *testing.T) {
+	dir := t.TempDir()
+	store := New(dir)
+
+	store.CreateSession(&session.Meta{SessionID: "s1", StartedAt: time.Now().UTC()})
+	store.AppendEvent("s1", parser.Event{Type: parser.EventUserInput, Timestamp: time.Now().UTC(), Text: "hello"})
+
+	results, err := store.SearchSessions(SearchOptions{Query: ""})
+	if err != nil {
+		t.Fatalf("SearchSessions: %v", err)
+	}
+	if results != nil {
+		t.Errorf("expected nil for empty query, got %d results", len(results))
+	}
+}
+
+func TestCompressSession(t *testing.T) {
+	dir := t.TempDir()
+	store := New(dir)
+
+	store.CreateSession(&session.Meta{SessionID: "compress-test"})
+	store.AppendRawOutput("compress-test", []byte("hello world raw output data"))
+
+	sessDir := store.SessionDir("compress-test")
+
+	// raw.log should exist before compression.
+	if _, err := os.Stat(filepath.Join(sessDir, "raw.log")); err != nil {
+		t.Fatalf("raw.log should exist before compress: %v", err)
+	}
+
+	if err := store.CompressSession("compress-test"); err != nil {
+		t.Fatalf("CompressSession: %v", err)
+	}
+
+	// raw.log.gz should exist after compression.
+	if _, err := os.Stat(filepath.Join(sessDir, "raw.log.gz")); err != nil {
+		t.Errorf("raw.log.gz should exist after compress: %v", err)
+	}
+
+	// Original raw.log should be removed.
+	if _, err := os.Stat(filepath.Join(sessDir, "raw.log")); !os.IsNotExist(err) {
+		t.Errorf("raw.log should be removed after compress")
+	}
+}
+
+func TestCompressOldSessions(t *testing.T) {
+	dir := t.TempDir()
+	store := New(dir)
+
+	oldTime := time.Now().UTC().Add(-48 * time.Hour)
+	newTime := time.Now().UTC()
+
+	store.CreateSession(&session.Meta{SessionID: "old-sess", StartedAt: oldTime})
+	store.AppendRawOutput("old-sess", []byte("old raw data that should be compressed"))
+
+	store.CreateSession(&session.Meta{SessionID: "new-sess", StartedAt: newTime})
+	store.AppendRawOutput("new-sess", []byte("new raw data that should stay"))
+
+	compressed, err := store.CompressOldSessions(24)
+	if err != nil {
+		t.Fatalf("CompressOldSessions: %v", err)
+	}
+	if compressed != 1 {
+		t.Errorf("expected 1 compressed, got %d", compressed)
+	}
+
+	// Old session should have .gz file.
+	if _, err := os.Stat(filepath.Join(store.SessionDir("old-sess"), "raw.log.gz")); err != nil {
+		t.Errorf("old session raw.log.gz should exist: %v", err)
+	}
+
+	// New session should still have raw.log (not compressed).
+	if _, err := os.Stat(filepath.Join(store.SessionDir("new-sess"), "raw.log")); err != nil {
+		t.Errorf("new session raw.log should still exist: %v", err)
+	}
+}
+
+func TestPruneOldSessions(t *testing.T) {
+	dir := t.TempDir()
+	store := New(dir)
+
+	oldTime := time.Now().UTC().Add(-10 * 24 * time.Hour) // 10 days ago
+	endedTime := oldTime.Add(time.Hour)
+
+	store.CreateSession(&session.Meta{
+		SessionID: "old-ended",
+		StartedAt: oldTime,
+		EndedAt:   &endedTime,
+		Status:    session.StatusEnded,
+	})
+
+	pruned, err := store.PruneOldSessions(7)
+	if err != nil {
+		t.Fatalf("PruneOldSessions: %v", err)
+	}
+	if pruned != 1 {
+		t.Errorf("expected 1 pruned, got %d", pruned)
+	}
+
+	// Session directory should be gone.
+	if _, err := os.Stat(store.SessionDir("old-ended")); !os.IsNotExist(err) {
+		t.Errorf("old-ended session dir should be removed")
+	}
+}
+
+func TestPruneProtects24hSessions(t *testing.T) {
+	dir := t.TempDir()
+	store := New(dir)
+
+	// Create a session started 12h ago (within 24h protection).
+	recentTime := time.Now().UTC().Add(-12 * time.Hour)
+	endedTime := recentTime.Add(time.Hour)
+
+	store.CreateSession(&session.Meta{
+		SessionID: "recent-ended",
+		StartedAt: recentTime,
+		EndedAt:   &endedTime,
+		Status:    session.StatusEnded,
+	})
+
+	pruned, err := store.PruneOldSessions(0) // retention 0 days = delete everything old
+	if err != nil {
+		t.Fatalf("PruneOldSessions: %v", err)
+	}
+	if pruned != 0 {
+		t.Errorf("expected 0 pruned (24h protection), got %d", pruned)
+	}
+
+	// Session directory should still exist.
+	if _, err := os.Stat(store.SessionDir("recent-ended")); err != nil {
+		t.Errorf("recent session dir should still exist: %v", err)
+	}
+}
+
+func TestEnforceDiskCap(t *testing.T) {
+	dir := t.TempDir()
+	store := New(dir)
+
+	oldTime := time.Now().UTC().Add(-48 * time.Hour)
+
+	// Create sessions with large raw.log files.
+	for i := 0; i < 3; i++ {
+		sid := fmt.Sprintf("big-%d", i)
+		store.CreateSession(&session.Meta{SessionID: sid, StartedAt: oldTime.Add(time.Duration(i) * time.Hour)})
+		// Write ~1KB per session.
+		store.AppendRawOutput(sid, make([]byte, 1024))
+	}
+
+	total, _ := store.TotalDiskUsage()
+	if total == 0 {
+		t.Fatal("total disk usage should be > 0")
+	}
+
+	// Set cap to 1 byte to force cleanup of everything eligible.
+	// EnforceDiskCap uses GB, but we can test the logic with a 0 GB cap.
+	// With 0 GB cap = 0 bytes, everything old should be cleaned.
+	err := store.EnforceDiskCap(0)
+	if err != nil {
+		t.Fatalf("EnforceDiskCap: %v", err)
+	}
+
+	// After enforcement, total should be reduced. Sessions > 24h old should be cleaned.
+	afterTotal, _ := store.TotalDiskUsage()
+	if afterTotal >= total {
+		t.Errorf("expected disk usage to decrease: before=%d, after=%d", total, afterTotal)
+	}
+}
+
+func TestSessionDiskUsage(t *testing.T) {
+	dir := t.TempDir()
+	store := New(dir)
+
+	store.CreateSession(&session.Meta{SessionID: "disk-test"})
+	store.AppendRawOutput("disk-test", []byte("some raw data"))
+	store.AppendEvent("disk-test", parser.Event{
+		Type: parser.EventUserInput, Timestamp: time.Now().UTC(), Text: "hello",
+	})
+
+	usage, err := store.SessionDiskUsage("disk-test")
+	if err != nil {
+		t.Fatalf("SessionDiskUsage: %v", err)
+	}
+	if usage <= 0 {
+		t.Errorf("expected positive disk usage, got %d", usage)
+	}
+}
+
+func TestDeleteSession(t *testing.T) {
+	dir := t.TempDir()
+	store := New(dir)
+
+	store.CreateSession(&session.Meta{SessionID: "delete-me"})
+	store.AppendRawOutput("delete-me", []byte("data"))
+
+	if _, err := os.Stat(store.SessionDir("delete-me")); err != nil {
+		t.Fatalf("session dir should exist before delete: %v", err)
+	}
+
+	if err := store.DeleteSession("delete-me"); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+
+	if _, err := os.Stat(store.SessionDir("delete-me")); !os.IsNotExist(err) {
+		t.Errorf("session dir should be removed after delete")
 	}
 }
 

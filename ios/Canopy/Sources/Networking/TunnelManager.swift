@@ -4,7 +4,11 @@ import OSLog
 
 private let logger = Logger(subsystem: "dev.canopy.app", category: "TunnelManager")
 
-/// Manages the WireGuard tunnel lifecycle and NAT traversal connection flow.
+/// Manages the WireGuard tunnel lifecycle and NAT traversal connection flow
+/// for multiple paired Macs simultaneously.
+///
+/// Each paired Mac is a separate WireGuard peer. The tunnel configuration
+/// contains all peers so that the single VPN tunnel routes to all Macs.
 ///
 /// Implements the connection flow from PLAN.md section 4.5:
 /// 1. STUN to get own public endpoint
@@ -14,7 +18,7 @@ private let logger = Logger(subsystem: "dev.canopy.app", category: "TunnelManage
 /// 5. Connect through TURN relay
 ///
 /// Also monitors network path changes (WiFi <-> cellular) and re-establishes
-/// the tunnel when the network changes.
+/// connections when the network changes.
 @MainActor
 @Observable
 final class TunnelManager {
@@ -29,17 +33,23 @@ final class TunnelManager {
         case failed(String)
     }
 
-    private(set) var state: TunnelState = .disconnected
-    private(set) var currentEndpoint: Endpoint?
+    /// Per-peer connection state, keyed by WireGuard public key.
+    private(set) var peerStates: [String: TunnelState] = [:]
+
+    /// Per-peer resolved endpoint, keyed by WireGuard public key.
+    private(set) var peerEndpoints: [String: Endpoint] = [:]
+
+    /// Overall tunnel state (the Network Extension VPN itself).
+    private(set) var tunnelActive: Bool = false
 
     private let coordinationClient: CoordinationClient
     private var pathMonitor: NWPathMonitor?
     private var monitorQueue: DispatchQueue?
-    private var connectionTask: Task<Void, Never>?
+    private var connectionTasks: [String: Task<Void, Never>] = [:]
     private var currentPath: NWPath?
 
-    /// Called when the tunnel state changes, allowing the ConnectionManager to react.
-    var onStateChange: (@Sendable (TunnelState) -> Void)?
+    /// Called when a peer's tunnel state changes.
+    var onPeerStateChange: (@Sendable (_ peerWGKey: String, _ state: TunnelState) -> Void)?
 
     /// Time to wait for a direct WireGuard handshake before falling back to TURN.
     private static let directHandshakeTimeout: TimeInterval = 5.0
@@ -53,45 +63,111 @@ final class TunnelManager {
 
     // MARK: - Public API
 
-    /// Start monitoring network changes and establish the tunnel.
+    /// Start monitoring network changes.
     func start() {
         startNetworkMonitor()
+        tunnelActive = true
     }
 
-    /// Stop monitoring and tear down the tunnel.
+    /// Stop monitoring and tear down all peer connections.
     func stop() {
-        connectionTask?.cancel()
-        connectionTask = nil
+        for (_, task) in connectionTasks {
+            task.cancel()
+        }
+        connectionTasks.removeAll()
+        peerStates.removeAll()
+        peerEndpoints.removeAll()
         pathMonitor?.cancel()
         pathMonitor = nil
-        state = .disconnected
-        onStateChange?(.disconnected)
+        tunnelActive = false
     }
 
-    /// Initiate the connection flow to a specific Mac.
+    /// Add a peer and initiate the connection flow.
+    ///
+    /// Each paired Mac is a WireGuard peer with its own allowed IP (100.100.x.x/32).
+    /// Adding a peer updates the VPN configuration dynamically.
+    func addPeer(wgPublicKey: String) {
+        guard connectionTasks[wgPublicKey] == nil else {
+            logger.info("Peer \(wgPublicKey.prefix(8)) already has an active connection task")
+            return
+        }
+        peerStates[wgPublicKey] = .disconnected
+        connect(peerWGKey: wgPublicKey)
+    }
+
+    /// Remove a peer and tear down its connection.
+    func removePeer(wgPublicKey: String) {
+        connectionTasks[wgPublicKey]?.cancel()
+        connectionTasks.removeValue(forKey: wgPublicKey)
+        peerStates.removeValue(forKey: wgPublicKey)
+        peerEndpoints.removeValue(forKey: wgPublicKey)
+        logger.info("Removed peer \(wgPublicKey.prefix(8))")
+        // In real implementation: update the NETunnelProviderManager config
+        // to remove this peer from the WireGuard interface.
+    }
+
+    /// Initiate the connection flow to a specific Mac peer.
     ///
     /// Follows the NAT traversal flow from PLAN.md section 4.5:
     /// STUN -> endpoint lookup -> direct attempt -> TURN fallback.
     func connect(peerWGKey: String) {
-        connectionTask?.cancel()
-        connectionTask = Task { [weak self] in
+        connectionTasks[peerWGKey]?.cancel()
+        connectionTasks[peerWGKey] = Task { [weak self] in
             guard let self else { return }
             await self.performConnectionFlow(peerWGKey: peerWGKey)
         }
     }
 
-    /// Force reconnection (e.g., after network change).
+    /// Disconnect a specific peer without removing it.
+    func disconnect(peerWGKey: String) {
+        connectionTasks[peerWGKey]?.cancel()
+        connectionTasks.removeValue(forKey: peerWGKey)
+        peerStates[peerWGKey] = .disconnected
+        onPeerStateChange?(peerWGKey, .disconnected)
+    }
+
+    /// Force reconnection for a specific peer (e.g., user-initiated).
     func reconnect(peerWGKey: String) {
-        logger.info("Reconnecting tunnel due to network change")
+        logger.info("Reconnecting peer \(peerWGKey.prefix(8))")
         connect(peerWGKey: peerWGKey)
+    }
+
+    /// Reconnect all peers (e.g., after network change).
+    func reconnectAll() {
+        for wgKey in peerStates.keys {
+            reconnect(peerWGKey: wgKey)
+        }
+    }
+
+    /// The state for a specific peer, or `.disconnected` if unknown.
+    func state(for peerWGKey: String) -> TunnelState {
+        peerStates[peerWGKey] ?? .disconnected
+    }
+
+    /// Whether a specific peer is connected (direct or relay).
+    func isConnected(_ peerWGKey: String) -> Bool {
+        switch peerStates[peerWGKey] {
+        case .connectedDirect, .connectedRelay:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Whether any peer is connected.
+    var hasAnyConnectedPeer: Bool {
+        peerStates.values.contains { state in
+            if case .connectedDirect = state { return true }
+            if case .connectedRelay = state { return true }
+            return false
+        }
     }
 
     // MARK: - Connection Flow
 
     private func performConnectionFlow(peerWGKey: String) async {
         // Step 1: STUN to discover our public endpoint
-        state = .discoveringEndpoints
-        onStateChange?(.discoveringEndpoints)
+        updatePeerState(peerWGKey, .discoveringEndpoints)
 
         let ownEndpoint: Endpoint?
         do {
@@ -105,68 +181,62 @@ final class TunnelManager {
         guard !Task.isCancelled else { return }
 
         // Step 2: Look up the Mac's endpoints from the coordination server
-        let peerEndpoints: EndpointLookupResponse
+        let peerEndpointLookup: EndpointLookupResponse
         do {
-            peerEndpoints = try await coordinationClient.lookupEndpoints(peerWGKey: peerWGKey)
-            logger.info("Peer has \(peerEndpoints.endpoints.count) endpoints, online=\(peerEndpoints.online)")
+            peerEndpointLookup = try await coordinationClient.lookupEndpoints(peerWGKey: peerWGKey)
+            logger.info("Peer \(peerWGKey.prefix(8)) has \(peerEndpointLookup.endpoints.count) endpoints, online=\(peerEndpointLookup.online)")
         } catch {
-            logger.error("Endpoint lookup failed: \(error)")
-            state = .failed("Could not find Mac endpoints")
-            onStateChange?(state)
+            logger.error("Endpoint lookup failed for \(peerWGKey.prefix(8)): \(error)")
+            updatePeerState(peerWGKey, .failed("Could not find Mac endpoints"))
             return
         }
 
         guard !Task.isCancelled else { return }
-        guard !peerEndpoints.endpoints.isEmpty else {
-            state = .failed("Mac has no registered endpoints")
-            onStateChange?(state)
+        guard !peerEndpointLookup.endpoints.isEmpty else {
+            updatePeerState(peerWGKey, .failed("Mac has no registered endpoints"))
             return
         }
 
         // Step 3: Try direct WireGuard handshake
-        state = .attemptingDirect
-        onStateChange?(.attemptingDirect)
+        updatePeerState(peerWGKey, .attemptingDirect)
 
         let directSuccess = await attemptDirectConnection(
-            peerEndpoints: peerEndpoints.endpoints,
+            peerEndpoints: peerEndpointLookup.endpoints,
             peerWGKey: peerWGKey
         )
 
         guard !Task.isCancelled else { return }
 
         if directSuccess {
-            state = .connectedDirect
-            currentEndpoint = peerEndpoints.endpoints.first
-            onStateChange?(.connectedDirect)
-            logger.info("Direct P2P connection established")
+            peerEndpoints[peerWGKey] = peerEndpointLookup.endpoints.first
+            updatePeerState(peerWGKey, .connectedDirect)
+            logger.info("Direct P2P connection established to \(peerWGKey.prefix(8))")
             return
         }
 
         // Step 4: Request TURN allocation
-        logger.info("Direct connection failed after \(Self.directHandshakeTimeout)s, requesting TURN")
-        state = .requestingTURN
-        onStateChange?(.requestingTURN)
+        logger.info("Direct connection failed for \(peerWGKey.prefix(8)) after \(Self.directHandshakeTimeout)s, requesting TURN")
+        updatePeerState(peerWGKey, .requestingTURN)
 
         let turnSuccess = await attemptTURNConnection(peerWGKey: peerWGKey)
 
         guard !Task.isCancelled else { return }
 
         if turnSuccess {
-            state = .connectedRelay
-            onStateChange?(.connectedRelay)
-            logger.info("TURN relay connection established")
+            updatePeerState(peerWGKey, .connectedRelay)
+            logger.info("TURN relay connection established to \(peerWGKey.prefix(8))")
         } else {
-            state = .failed("Could not establish connection (direct or relay)")
-            onStateChange?(state)
-            logger.error("All connection attempts failed")
+            updatePeerState(peerWGKey, .failed("Could not establish connection (direct or relay)"))
+            logger.error("All connection attempts failed for \(peerWGKey.prefix(8))")
         }
     }
 
+    private func updatePeerState(_ peerWGKey: String, _ state: TunnelState) {
+        peerStates[peerWGKey] = state
+        onPeerStateChange?(peerWGKey, state)
+    }
+
     /// Attempt a direct WireGuard handshake to the peer's endpoints.
-    ///
-    /// Tries each endpoint (public first, then local) with a timeout.
-    /// In the real implementation, this updates the WireGuard peer's endpoint
-    /// via the Network Extension and waits for a successful handshake.
     private func attemptDirectConnection(
         peerEndpoints: [Endpoint],
         peerWGKey: String
@@ -178,7 +248,7 @@ final class TunnelManager {
 
         for endpoint in sorted {
             guard !Task.isCancelled else { return false }
-            logger.info("Trying direct connection to \(endpoint.ip):\(endpoint.port)")
+            logger.info("Trying direct connection to \(endpoint.ip):\(endpoint.port) for peer \(peerWGKey.prefix(8))")
 
             // In the real implementation, this would:
             // 1. Update the NETunnelProviderManager peer endpoint
@@ -190,7 +260,7 @@ final class TunnelManager {
             )
 
             if success {
-                currentEndpoint = endpoint
+                self.peerEndpoints[peerWGKey] = endpoint
                 return true
             }
         }
@@ -199,9 +269,6 @@ final class TunnelManager {
     }
 
     /// Wait for a WireGuard handshake to succeed with a timeout.
-    ///
-    /// In the real implementation, this polls the WireGuard tunnel provider
-    /// for the latest handshake timestamp via IPC.
     private func waitForHandshake(endpoint: Endpoint, timeout: TimeInterval) async -> Bool {
         let deadline = ContinuousClock.now + .seconds(timeout)
 
@@ -223,26 +290,16 @@ final class TunnelManager {
     }
 
     /// Check if a WireGuard handshake has completed with the given endpoint.
-    ///
-    /// In real implementation, sends a message to the PacketTunnelProvider
-    /// to query the WireGuard interface statistics.
     private func checkHandshakeStatus(endpoint: Endpoint) async -> Bool {
         // Placeholder: will be implemented with Network Extension IPC
-        // Returns false until the real tunnel provider is wired up
         return false
     }
 
     /// Attempt a TURN-relayed connection through the coordination server.
     private func attemptTURNConnection(peerWGKey: String) async -> Bool {
-        // In the real implementation:
-        // 1. Request a TURN allocation from the coordination server
-        // 2. Receive a relay address
-        // 3. Update WireGuard peer endpoint to the TURN relay address
-        // 4. Wait for handshake through the relay
-
         // Placeholder: TURN protocol integration will be added
         // when the coordination server's TURN support is ready
-        logger.info("TURN relay connection attempt (pending coord server TURN support)")
+        logger.info("TURN relay attempt for peer \(peerWGKey.prefix(8)) (pending coord server TURN support)")
         return false
     }
 
@@ -266,30 +323,21 @@ final class TunnelManager {
         logger.info("Network path monitor started")
     }
 
-    /// Handle a network path change. Re-establishes the tunnel if needed.
+    /// Handle a network path change. Re-establishes peer connections if needed.
     private func handlePathUpdate(_ newPath: NWPath) {
         let previousPath = currentPath
         currentPath = newPath
 
         guard let previousPath else {
-            // First path update, nothing to compare
             logger.info("Initial network path: \(newPath.status == .satisfied ? "satisfied" : "unsatisfied")")
             return
         }
 
-        // Detect meaningful network change
         let networkChanged = hasNetworkChanged(from: previousPath, to: newPath)
 
         if networkChanged && newPath.status == .satisfied {
-            logger.info("Network changed (WiFi<->Cellular or IP change), tunnel re-establishment needed")
-            // Notify consumers so they can trigger reconnection
-            if case .connectedDirect = state {
-                state = .discoveringEndpoints
-                onStateChange?(.discoveringEndpoints)
-            } else if case .connectedRelay = state {
-                state = .discoveringEndpoints
-                onStateChange?(.discoveringEndpoints)
-            }
+            logger.info("Network changed, reconnecting all peers")
+            reconnectAll()
         } else if newPath.status == .unsatisfied {
             logger.warning("Network path unsatisfied - no connectivity")
         }
@@ -297,7 +345,6 @@ final class TunnelManager {
 
     /// Determine if a meaningful network change occurred.
     private func hasNetworkChanged(from oldPath: NWPath, to newPath: NWPath) -> Bool {
-        // Check if the interface type changed (WiFi <-> Cellular)
         let oldInterfaces = Set(oldPath.availableInterfaces.map(\.type))
         let newInterfaces = Set(newPath.availableInterfaces.map(\.type))
 
@@ -305,7 +352,6 @@ final class TunnelManager {
             return true
         }
 
-        // Check if connectivity status changed
         if oldPath.status != newPath.status {
             return true
         }

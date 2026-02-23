@@ -6,6 +6,9 @@ import SwiftUI
 /// user input on the right, system responses on the left.
 /// AI-enhanced events replace raw output when available.
 /// Per section 5.4 of the spec.
+///
+/// When the session is ended, enters read-only mode:
+/// loads history via get_history, disables input, shows end time.
 struct ConversationView: View {
     let sessionId: String
     let appState: AppState
@@ -21,7 +24,12 @@ struct ConversationView: View {
         appState.eventStore.events(for: sessionId)
     }
 
+    private var isEnded: Bool {
+        session?.status == .ended
+    }
+
     private var pendingApproval: SessionEvent.AIApproval? {
+        guard !isEnded else { return nil }
         // Find the most recent unanswered AI approval
         for event in events.reversed() {
             if case .aiApproval(let approval) = event {
@@ -35,6 +43,18 @@ struct ConversationView: View {
         return nil
     }
 
+    /// File contents for the currently requested path.
+    private var fileContents: DaemonMessage.FileContentsPayload? {
+        guard let path = fileViewerPath else { return nil }
+        return appState.fileContentsCache[path]
+    }
+
+    /// Error for the currently requested file path.
+    private var fileError: String? {
+        guard let path = fileViewerPath else { return nil }
+        return appState.fileErrors[path]
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
@@ -43,6 +63,10 @@ struct ConversationView: View {
                         ForEach(Array(events.enumerated()), id: \.offset) { index, event in
                             eventView(for: event, at: index)
                                 .id(index)
+                        }
+
+                        if isEnded {
+                            sessionEndedFooter
                         }
                     }
                     .padding(.horizontal, 12)
@@ -57,26 +81,30 @@ struct ConversationView: View {
 
             Divider()
 
-            if let approval = pendingApproval {
-                AIApprovalBanner(
-                    approval: approval,
-                    onApprove: { Task { await appState.approveAction(for: sessionId) } },
-                    onReject: { Task { await appState.rejectAction(for: sessionId) } }
+            if isEnded {
+                sessionEndedBar
+            } else {
+                if let approval = pendingApproval {
+                    AIApprovalBanner(
+                        approval: approval,
+                        onApprove: { Task { await appState.approveAction(for: sessionId) } },
+                        onReject: { Task { await appState.rejectAction(for: sessionId) } }
+                    )
+                }
+
+                InputBar(
+                    text: $inputText,
+                    placeholder: inputPlaceholder,
+                    onSend: {
+                        let text = inputText
+                        inputText = ""
+                        Task { await appState.sendInput(text, to: sessionId) }
+                    },
+                    onInterrupt: {
+                        Task { await appState.sendInterrupt(to: sessionId) }
+                    }
                 )
             }
-
-            InputBar(
-                text: $inputText,
-                placeholder: inputPlaceholder,
-                onSend: {
-                    let text = inputText
-                    inputText = ""
-                    Task { await appState.sendInput(text, to: sessionId) }
-                },
-                onInterrupt: {
-                    Task { await appState.sendInterrupt(to: sessionId) }
-                }
-            )
         }
         .navigationTitle(session?.title ?? session?.currentProcess ?? "Session")
         .navigationBarTitleDisplayMode(.inline)
@@ -87,25 +115,82 @@ struct ConversationView: View {
                         .font(.headline)
                         .lineLimit(1)
                     if let hostname = session?.hostname {
-                        Text(hostname)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                        HStack(spacing: 4) {
+                            Image(systemName: "desktopcomputer")
+                                .font(.caption2)
+                            Text(hostname)
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                     }
                 }
             }
         }
         .task {
-            await appState.subscribeToSession(sessionId)
+            if isEnded {
+                // For ended sessions, just load history without subscribing
+                await appState.loadHistory(for: sessionId)
+            } else {
+                await appState.subscribeToSession(sessionId)
+            }
         }
         .onDisappear {
-            Task { await appState.unsubscribeFromSession(sessionId) }
+            if !isEnded {
+                Task { await appState.unsubscribeFromSession(sessionId) }
+            }
         }
         .sheet(item: $fileViewerPath) { path in
-            // File viewer requires content to be fetched via WebSocket read_file.
-            // For now, show a placeholder. Full implementation will send a read_file
-            // message and present the content when the fileContents response arrives.
-            FileViewerSheet(path: path, content: "Loading...", language: nil)
+            FileViewerSheet(
+                path: path,
+                content: fileContents?.content,
+                language: fileContents?.language,
+                errorMessage: fileError
+            )
         }
+        .onChange(of: fileViewerPath) { _, newPath in
+            if let path = newPath {
+                Task { await appState.readFile(path: path, forSession: sessionId) }
+            }
+        }
+    }
+
+    // MARK: - Ended session UI
+
+    private var sessionEndedBar: some View {
+        HStack {
+            Spacer()
+            Text("Session ended")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 14)
+        .background(Color(.systemBackground))
+        .accessibilityLabel("Session has ended, input is disabled")
+    }
+
+    private var sessionEndedFooter: some View {
+        VStack(spacing: 4) {
+            Divider()
+                .padding(.vertical, 8)
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let endTime = session?.lastActivityAt {
+                    Text("Session ended \(endTime.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Session ended")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.bottom, 8)
+        }
+        .accessibilityLabel("Session ended")
     }
 
     private var inputPlaceholder: String {
@@ -141,8 +226,13 @@ struct ConversationView: View {
             }
 
         case .inputRequest(let payload):
-            InputRequestCard(payload: payload) { response in
-                Task { await appState.sendInput(response, to: sessionId) }
+            if isEnded {
+                // In read-only mode, show the request without the action handler
+                InputRequestCard(payload: payload) { _ in }
+            } else {
+                InputRequestCard(payload: payload) { response in
+                    Task { await appState.sendInput(response, to: sessionId) }
+                }
             }
 
         case .idle:

@@ -22,8 +22,23 @@ final class AppState {
     /// Whether the onboarding flow should be shown.
     var showOnboarding: Bool = false
 
+    /// A session ID from a deep link or notification tap, consumed by the view layer.
+    var pendingDeepLinkSessionId: String?
+
     /// Paired Mac devices (loaded from Keychain/persistent storage).
     private(set) var pairedDevices: [MacDevice] = []
+
+    /// File contents response from the daemon, keyed by path.
+    private(set) var fileContentsCache: [String: DaemonMessage.FileContentsPayload] = [:]
+
+    /// Error message for a failed file read, keyed by path.
+    private(set) var fileErrors: [String: String] = [:]
+
+    /// Latest search results from all connected Macs.
+    private(set) var searchResults: [DaemonMessage.SearchResultsPayload.SearchResult] = []
+
+    /// Whether a search is currently in progress.
+    private(set) var isSearching: Bool = false
 
     init() {
         let sessionStore = SessionStore()
@@ -35,6 +50,14 @@ final class AppState {
         self.eventStore = eventStore
         self.router = router
         self.connectionManager = connectionManager
+
+        // Wire up router callbacks
+        router.onFileContents = { [weak self] payload in
+            self?.handleFileContents(payload)
+        }
+        router.onSearchResults = { [weak self] payload in
+            self?.handleSearchResults(payload)
+        }
     }
 
     // MARK: - Device management
@@ -90,6 +113,19 @@ final class AppState {
         }
     }
 
+    /// Load history for an ended session (no subscription needed).
+    func loadHistory(for sessionId: String) async {
+        guard let deviceId = sessionStore.deviceId(for: sessionId) else { return }
+        do {
+            let historyMsg = ClientMessage.getHistory(
+                .init(sessionId: sessionId, since: nil, limit: 500)
+            )
+            try await connectionManager.send(historyMsg, to: deviceId)
+        } catch {
+            logger.error("Failed to load history for session \(sessionId): \(error)")
+        }
+    }
+
     /// Unsubscribe from a session's events.
     func unsubscribeFromSession(_ sessionId: String) async {
         guard let deviceId = sessionStore.deviceId(for: sessionId) else { return }
@@ -126,7 +162,13 @@ final class AppState {
         let yesBytes = Data("y\n".utf8).base64EncodedString()
         do {
             try await connectionManager.sendRawInput(yesBytes, sessionId: sessionId, on: deviceId)
+            #if os(iOS)
+            HapticService.success()
+            #endif
         } catch {
+            #if os(iOS)
+            HapticService.error()
+            #endif
             logger.error("Failed to send approval for session \(sessionId): \(error)")
         }
     }
@@ -137,9 +179,74 @@ final class AppState {
         let noBytes = Data("n\n".utf8).base64EncodedString()
         do {
             try await connectionManager.sendRawInput(noBytes, sessionId: sessionId, on: deviceId)
+            #if os(iOS)
+            HapticService.success()
+            #endif
         } catch {
+            #if os(iOS)
+            HapticService.error()
+            #endif
             logger.error("Failed to send rejection for session \(sessionId): \(error)")
         }
+    }
+
+    // MARK: - File reading
+
+    /// Request file contents from the Mac that owns the given session.
+    func readFile(path: String, forSession sessionId: String) async {
+        guard let deviceId = sessionStore.deviceId(for: sessionId) else { return }
+
+        // Clear previous state for this path
+        fileContentsCache.removeValue(forKey: path)
+        fileErrors.removeValue(forKey: path)
+
+        do {
+            let msg = ClientMessage.readFile(.init(path: path, maxBytes: 1_000_000))
+            try await connectionManager.send(msg, to: deviceId)
+        } catch {
+            fileErrors[path] = error.localizedDescription
+            logger.error("Failed to request file \(path): \(error)")
+        }
+    }
+
+    /// Handle incoming file contents from the daemon.
+    private func handleFileContents(_ payload: DaemonMessage.FileContentsPayload) {
+        fileContentsCache[payload.path] = payload
+    }
+
+    // MARK: - Search
+
+    /// Search sessions across all connected Macs.
+    func searchSessions(query: String) async {
+        guard !query.isEmpty else { return }
+        isSearching = true
+        searchResults = []
+
+        let msg = ClientMessage.searchSessions(.init(query: query, limit: 50))
+        for deviceId in connectionManager.connectedDeviceIds {
+            do {
+                try await connectionManager.send(msg, to: deviceId)
+            } catch {
+                logger.error("Failed to send search to \(deviceId): \(error)")
+            }
+        }
+
+        // Timeout: if no results arrive within 5 seconds, stop searching
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            if isSearching {
+                isSearching = false
+            }
+        }
+    }
+
+    /// Handle incoming search results from the daemon.
+    private func handleSearchResults(_ payload: DaemonMessage.SearchResultsPayload) {
+        // Merge results, avoiding duplicates by session ID
+        let existingIds = Set(searchResults.map(\.sessionId))
+        let newResults = payload.results.filter { !existingIds.contains($0.sessionId) }
+        searchResults.append(contentsOf: newResults)
+        isSearching = false
     }
 
     // MARK: - Persistence (placeholder — real implementation uses Keychain)

@@ -11,6 +11,10 @@ private let logger = Logger(subsystem: "dev.canopy.app", category: "AppDelegate"
 /// SwiftUI lifecycle delegates push registration and notification handling here.
 /// Coordinates with PushNotificationService for token management and
 /// notification action handling (approve/reject from lock screen).
+///
+/// Also manages:
+/// - App badge count (attention sessions)
+/// - Deep link routing from notification taps (canopy://session/{id})
 final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
 
     /// Reference to the push notification service, set by CanopyApp on launch.
@@ -27,6 +31,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     ) -> Bool {
         UNUserNotificationCenter.current().delegate = self
         return true
+    }
+
+    func applicationDidBecomeActive(_ application: UIApplication) {
+        // Clear badge when the user opens the app
+        application.applicationIconBadgeNumber = 0
     }
 
     func application(
@@ -56,10 +65,23 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         Task { @MainActor in
+            // Update badge to reflect current attention count
+            updateBadgeCount()
+
             pushService?.handleBackgroundNotification(userInfo: userInfo) { success in
                 completionHandler(success ? .newData : .noData)
             }
         }
+    }
+
+    // MARK: - Deep link handling (canopy://session/{sessionId})
+
+    func application(
+        _ application: UIApplication,
+        open url: URL,
+        options: [UIApplication.OpenURLOptionsKey: Any] = [:]
+    ) -> Bool {
+        handleDeepLink(url)
     }
 
     // MARK: - UNUserNotificationCenterDelegate
@@ -113,14 +135,49 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 
         case PushNotificationService.openAction,
              UNNotificationDefaultActionIdentifier:
-            // Navigate to the session in the app
+            // Deep link to the session
             await MainActor.run {
+                appState?.pendingDeepLinkSessionId = sessionId
                 appState?.selectedSessionId = sessionId
             }
 
         default:
             break
         }
+    }
+
+    // MARK: - Badge
+
+    /// Update the app icon badge to the current attention count from SessionStore.
+    func updateBadgeCount() {
+        guard let appState else { return }
+        let count = appState.sessionStore.attentionCount
+        UIApplication.shared.applicationIconBadgeNumber = count
+    }
+
+    // MARK: - Deep Links
+
+    /// Parse a canopy:// URL and set the pending navigation in AppState.
+    ///
+    /// Supported schemes:
+    /// - canopy://session/{sessionId}
+    @discardableResult
+    private func handleDeepLink(_ url: URL) -> Bool {
+        guard url.scheme == "canopy" else { return false }
+
+        // canopy://session/{sessionId}
+        if url.host == "session",
+           let sessionId = url.pathComponents.dropFirst().first, !sessionId.isEmpty {
+            Task { @MainActor in
+                appState?.pendingDeepLinkSessionId = sessionId
+                appState?.selectedSessionId = sessionId
+            }
+            logger.info("Deep link to session: \(sessionId)")
+            return true
+        }
+
+        logger.warning("Unrecognized deep link: \(url.absoluteString)")
+        return false
     }
 
     // MARK: - Background Approval Handling

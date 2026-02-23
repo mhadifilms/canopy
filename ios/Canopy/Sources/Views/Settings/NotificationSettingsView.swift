@@ -1,11 +1,16 @@
 import SwiftUI
 
-/// Per-trigger notification toggles.
+/// Per-category notification toggles.
+///
+/// Persists preferences to UserDefaults so that the push notification
+/// service can check which categories the user has enabled.
 struct NotificationSettingsView: View {
-    @State private var approvalNotifications = true
-    @State private var errorNotifications = true
-    @State private var completionNotifications = false
-    @State private var longRunningNotifications = false
+    @AppStorage("notify.approvals") private var approvalNotifications = true
+    @AppStorage("notify.errors") private var errorNotifications = true
+    @AppStorage("notify.keywords") private var keywordAlerts = false
+    @AppStorage("notify.completions") private var completionNotifications = false
+    @AppStorage("notify.longRunning") private var longRunningNotifications = false
+    @AppStorage("notify.keywords.list") private var keywordList = ""
 
     var body: some View {
         List {
@@ -13,7 +18,7 @@ struct NotificationSettingsView: View {
                 Toggle(isOn: $approvalNotifications) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("AI Approval Requests")
-                        Text("When an AI tool needs approval")
+                        Text("When an AI tool needs your approval")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -30,7 +35,35 @@ struct NotificationSettingsView: View {
                 }
                 .accessibilityLabel("Error notifications, \(errorNotifications ? "enabled" : "disabled")")
             } header: {
-                Text("Enabled by default")
+                Text("Alerts")
+            } footer: {
+                Text("These are enabled by default and recommended for active monitoring.")
+            }
+
+            Section {
+                Toggle(isOn: $keywordAlerts) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Keyword Alerts")
+                        Text("Notify when output contains specific words")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .accessibilityLabel("Keyword alerts, \(keywordAlerts ? "enabled" : "disabled")")
+
+                if keywordAlerts {
+                    TextField("Keywords (comma-separated)", text: $keywordList)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .accessibilityLabel("Keyword list")
+                        .accessibilityHint("Enter keywords separated by commas")
+                }
+            } header: {
+                Text("Keyword Monitoring")
+            } footer: {
+                if keywordAlerts {
+                    Text("Example: error, FAIL, panic, segfault")
+                }
             }
 
             Section {

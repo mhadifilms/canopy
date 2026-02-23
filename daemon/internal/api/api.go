@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -464,58 +463,37 @@ func (s *Server) handleSearchSessions(ctx context.Context, client *Client, msg I
 		limit = 20
 	}
 
-	// Search across all sessions on disk.
-	sessionIDs, err := s.store.ListSessions()
+	opts := storage.SearchOptions{
+		Query: msg.Query,
+		Limit: limit,
+	}
+	if msg.DateRange != nil {
+		opts.From = msg.DateRange.From
+		opts.To = msg.DateRange.To
+	}
+
+	storeResults, err := s.store.SearchSessions(opts)
 	if err != nil {
 		s.sendError(ctx, client, "storage_error", err.Error())
 		return
 	}
 
-	var results []SearchResult
-	query := strings.ToLower(msg.Query)
-
-	for _, sid := range sessionIDs {
-		if len(results) >= limit {
-			break
-		}
-
-		meta, err := s.store.LoadMeta(sid)
-		if err != nil {
-			continue
-		}
-
-		events, err := s.store.ReadEvents(sid, nil, 0)
-		if err != nil {
-			continue
-		}
-
-		var matches []SearchMatch
-		for _, e := range events {
-			text := strings.ToLower(e.Text + e.Content)
-			if strings.Contains(text, query) {
-				snippet := e.Text
-				if snippet == "" {
-					snippet = e.Content
-				}
-				if len(snippet) > 200 {
-					snippet = snippet[:200]
-				}
-				matches = append(matches, SearchMatch{
-					EventType: string(e.Type),
-					Timestamp: e.Timestamp.Format(time.RFC3339),
-					Snippet:   snippet,
-				})
-			}
-		}
-
-		if len(matches) > 0 {
-			results = append(results, SearchResult{
-				SessionID: sid,
-				Title:     meta.Title,
-				StartedAt: meta.StartedAt.Format(time.RFC3339),
-				Matches:   matches,
+	results := make([]SearchResult, 0, len(storeResults))
+	for _, sr := range storeResults {
+		matches := make([]SearchMatch, 0, len(sr.Matches))
+		for _, m := range sr.Matches {
+			matches = append(matches, SearchMatch{
+				EventType: m.EventType,
+				Timestamp: m.Timestamp.Format(time.RFC3339),
+				Snippet:   m.Snippet,
 			})
 		}
+		results = append(results, SearchResult{
+			SessionID: sr.SessionID,
+			Title:     sr.Title,
+			StartedAt: sr.StartedAt.Format(time.RFC3339),
+			Matches:   matches,
+		})
 	}
 
 	s.send(ctx, client, OutgoingMessage{
@@ -536,7 +514,8 @@ func (s *Server) broadcastRemoteInput(sessionID, senderID, text string) {
 		Text:       text,
 		FromDevice: senderID,
 	}
-	sess.Broadcast(event)
+	// Send to all OTHER subscribers, not the sender.
+	sess.BroadcastExcept(event, senderID)
 }
 
 // BroadcastSessionStatus sends a session_status message to ALL connected clients.

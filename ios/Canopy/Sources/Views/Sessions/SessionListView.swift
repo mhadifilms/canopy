@@ -4,10 +4,23 @@ import SwiftUI
 ///
 /// Groups: Needs Attention -> Running -> Idle
 /// Per section 5.5 of the spec.
+///
+/// Sessions from all Macs are merged into one list.
+/// Each session shows a device indicator with a per-Mac color.
 struct SessionListView: View {
     let appState: AppState
 
     @State private var isRefreshing = false
+
+    /// Stable mapping of device ID to color for visual distinction.
+    private var deviceColors: [String: Color] {
+        let palette: [Color] = [.blue, .purple, .teal, .indigo, .mint, .cyan, .pink, .orange]
+        var map: [String: Color] = [:]
+        for (index, device) in appState.pairedDevices.enumerated() {
+            map[device.deviceId] = palette[index % palette.count]
+        }
+        return map
+    }
 
     var body: some View {
         NavigationStack {
@@ -16,7 +29,10 @@ struct SessionListView: View {
                     Section {
                         ForEach(appState.sessionStore.needsAttention) { session in
                             NavigationLink(value: session.sessionId) {
-                                SessionRowView(session: session)
+                                SessionRowView(
+                                    session: session,
+                                    deviceColor: deviceColor(for: session)
+                                )
                             }
                             .accessibilityLabel(accessibilityLabel(for: session))
                         }
@@ -31,7 +47,10 @@ struct SessionListView: View {
                     Section {
                         ForEach(appState.sessionStore.running) { session in
                             NavigationLink(value: session.sessionId) {
-                                SessionRowView(session: session)
+                                SessionRowView(
+                                    session: session,
+                                    deviceColor: deviceColor(for: session)
+                                )
                             }
                             .accessibilityLabel(accessibilityLabel(for: session))
                         }
@@ -46,7 +65,10 @@ struct SessionListView: View {
                     Section {
                         ForEach(appState.sessionStore.idle) { session in
                             NavigationLink(value: session.sessionId) {
-                                SessionRowView(session: session)
+                                SessionRowView(
+                                    session: session,
+                                    deviceColor: deviceColor(for: session)
+                                )
                             }
                             .accessibilityLabel(accessibilityLabel(for: session))
                         }
@@ -99,6 +121,11 @@ struct SessionListView: View {
                 await appState.connectionManager.refreshAllSessions()
             }
         }
+    }
+
+    private func deviceColor(for session: Session) -> Color {
+        guard let deviceId = session.macDeviceId else { return .secondary }
+        return deviceColors[deviceId] ?? .secondary
     }
 
     private func accessibilityLabel(for session: Session) -> String {

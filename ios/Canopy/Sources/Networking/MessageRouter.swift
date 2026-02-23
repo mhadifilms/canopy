@@ -10,6 +10,12 @@ final class MessageRouter: Sendable {
     private let sessionStore: SessionStore
     private let eventStore: EventStore
 
+    /// Callback for file_contents responses. Keyed by file path.
+    var onFileContents: ((DaemonMessage.FileContentsPayload) -> Void)?
+
+    /// Callback for search_results responses.
+    var onSearchResults: ((DaemonMessage.SearchResultsPayload) -> Void)?
+
     init(sessionStore: SessionStore, eventStore: EventStore) {
         self.sessionStore = sessionStore
         self.eventStore = eventStore
@@ -50,13 +56,11 @@ final class MessageRouter: Sendable {
                 cursor: payload.nextCursor
             )
 
-        case .fileContents:
-            // Handled by the requesting view via a response callback
-            break
+        case .fileContents(let payload):
+            onFileContents?(payload)
 
-        case .searchResults:
-            // Handled by the search view via a response callback
-            break
+        case .searchResults(let payload):
+            onSearchResults?(payload)
 
         case .info(let payload):
             logger.info("Daemon info from \(deviceId): \(payload.hostname) v\(payload.version), \(payload.activeSessions) active sessions")
