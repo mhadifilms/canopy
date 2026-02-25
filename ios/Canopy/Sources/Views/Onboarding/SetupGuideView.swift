@@ -32,15 +32,15 @@ struct SetupGuideView: View {
             Text("Open Terminal on your Mac and run:")
                 .foregroundStyle(.secondary)
 
-            Text("curl -fsSL https://canopy.dev/install.sh | bash")
-                .font(.system(.body, design: .monospaced))
+            Text("curl -fsSL https://raw.githubusercontent.com/mhadifilms/canopy/main/daemon/install.sh | bash")
+                .font(.system(.caption, design: .monospaced))
                 .padding(12)
                 .background(
                     RoundedRectangle(cornerRadius: 8)
                         .fill(Color(.secondarySystemBackground))
                 )
                 .textSelection(.enabled)
-                .accessibilityLabel("Install command: curl dash f s s L https canopy dot dev slash install dot s h pipe bash")
+                .accessibilityLabel("Install command: curl dash f s s L raw github URL pipe bash")
 
             Spacer()
 

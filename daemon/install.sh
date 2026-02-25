@@ -1,13 +1,15 @@
 #!/bin/bash
 # Canopy Install Script
-# Usage: curl -fsSL https://canopy.dev/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/mhadifilms/canopy/main/daemon/install.sh | bash
 #
-# Installs canopyd, sets up shell hooks, generates keys, and starts the daemon.
+# Clones the repo, builds canopyd from source, sets up shell hooks, generates keys,
+# and starts the daemon.
 set -euo pipefail
 
-RELEASE_BASE="https://releases.canopy.dev/latest"
 INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="canopyd"
+REPO_URL="https://github.com/mhadifilms/canopy.git"
+BUILD_DIR="${HOME}/.canopy-build"
 
 # Colors for output
 RED='\033[0;31m'
@@ -25,71 +27,66 @@ if [ "$OS" != "Darwin" ]; then
     error "canopyd only supports macOS. Detected: $OS"
 fi
 
-ARCH="$(uname -m)"
-case "$ARCH" in
-    arm64|aarch64) ARCH_SUFFIX="darwin-arm64" ;;
-    x86_64)        ARCH_SUFFIX="darwin-amd64" ;;
-    *)             error "Unsupported architecture: $ARCH" ;;
-esac
-
 echo ""
-echo "  Installing canopyd ($ARCH_SUFFIX)..."
+echo "  Installing canopyd..."
 echo ""
 
-# --- 2. Download binary ---
-BINARY_URL="${RELEASE_BASE}/${BINARY_NAME}-${ARCH_SUFFIX}"
-CHECKSUMS_URL="${RELEASE_BASE}/checksums.txt"
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
-
-echo "  Downloading canopyd..."
-if ! curl -fsSL -o "${TMP_DIR}/${BINARY_NAME}" "$BINARY_URL" 2>/dev/null; then
-    warn "Could not download from ${BINARY_URL}"
-    warn "Trying local build..."
-    if [ -f "./bin/${BINARY_NAME}" ]; then
-        cp "./bin/${BINARY_NAME}" "${TMP_DIR}/${BINARY_NAME}"
-        info "Using local build"
-    else
-        error "Download failed and no local build found. Build with 'make build' first."
-    fi
+# --- 2. Check dependencies ---
+if ! command -v go &>/dev/null; then
+    error "Go is required but not installed. Install it from https://go.dev/dl/"
 fi
 
-# --- 3. Verify checksum ---
-echo "  Verifying checksum..."
-if curl -fsSL -o "${TMP_DIR}/checksums.txt" "$CHECKSUMS_URL" 2>/dev/null; then
-    EXPECTED=$(grep "${BINARY_NAME}-${ARCH_SUFFIX}" "${TMP_DIR}/checksums.txt" | awk '{print $1}')
-    if [ -n "$EXPECTED" ]; then
-        ACTUAL=$(shasum -a 256 "${TMP_DIR}/${BINARY_NAME}" | awk '{print $1}')
-        if [ "$EXPECTED" != "$ACTUAL" ]; then
-            error "Checksum verification failed!\n  Expected: $EXPECTED\n  Got:      $ACTUAL"
-        fi
-        info "Checksum verified"
-    else
-        warn "Checksum not found for ${ARCH_SUFFIX}, skipping verification"
-    fi
+if ! command -v git &>/dev/null; then
+    error "Git is required but not installed. Install Xcode CLI tools: xcode-select --install"
+fi
+
+GO_VERSION=$(go version | grep -oE 'go[0-9]+\.[0-9]+' | sed 's/go//')
+GO_MAJOR=$(echo "$GO_VERSION" | cut -d. -f1)
+GO_MINOR=$(echo "$GO_VERSION" | cut -d. -f2)
+if [ "$GO_MAJOR" -lt 1 ] || { [ "$GO_MAJOR" -eq 1 ] && [ "$GO_MINOR" -lt 21 ]; }; then
+    error "Go 1.21+ required. Found: go${GO_VERSION}. Update from https://go.dev/dl/"
+fi
+
+info "Go $(go version | grep -oE 'go[0-9]+\.[0-9]+\.[0-9]+') detected"
+
+# --- 3. Clone or update repo ---
+if [ -d "${BUILD_DIR}" ]; then
+    echo "  Updating existing checkout..."
+    cd "${BUILD_DIR}"
+    git pull --ff-only origin main 2>/dev/null || {
+        warn "Pull failed, doing fresh clone"
+        rm -rf "${BUILD_DIR}"
+        git clone --depth 1 "$REPO_URL" "${BUILD_DIR}"
+        cd "${BUILD_DIR}"
+    }
 else
-    warn "Could not fetch checksums, skipping verification"
+    echo "  Cloning canopy..."
+    git clone --depth 1 "$REPO_URL" "${BUILD_DIR}"
+    cd "${BUILD_DIR}"
 fi
 
-# --- 4. Install binary ---
+info "Source ready at ${BUILD_DIR}"
+
+# --- 4. Build binary ---
+echo "  Building canopyd..."
+cd "${BUILD_DIR}/daemon"
+go build -o "${BINARY_NAME}" ./cmd/canopyd || error "Build failed"
+
+info "Build succeeded"
+
+# --- 5. Install binary ---
 echo "  Installing to ${INSTALL_DIR}/${BINARY_NAME}..."
-chmod 755 "${TMP_DIR}/${BINARY_NAME}"
+chmod 755 "${BINARY_NAME}"
 if [ -w "$INSTALL_DIR" ]; then
-    mv "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+    mv "${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 else
-    sudo mv "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+    sudo mv "${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 fi
 info "canopyd installed to ${INSTALL_DIR}/${BINARY_NAME}"
 
-# --- 5. Create config directory ---
+# --- 6. Create config directory ---
 CONFIG_DIR="${HOME}/.config/canopy"
 mkdir -p "${CONFIG_DIR}/sessions" "${CONFIG_DIR}/parsers"
-
-# --- 6. Generate keys (if not already present) ---
-if [ ! -f "${CONFIG_DIR}/identity.key" ]; then
-    echo "  Generating identity keypair..."
-    # Use canopyd itself to set up keys and config
-fi
 
 # --- 7. Run canopyd setup (keys, config, shell hooks, launchd) ---
 echo "  Running setup..."
@@ -108,7 +105,6 @@ echo "  Running setup..."
 
     # WireGuard keypair (Curve25519)
     if [ ! -f "${CONFIG_DIR}/wg_private.key" ]; then
-        # Generate a random 32-byte key
         head -c 32 /dev/urandom > "${CONFIG_DIR}/wg_private.key"
         chmod 600 "${CONFIG_DIR}/wg_private.key"
         info "WireGuard keypair generated"
@@ -151,15 +147,12 @@ CONFIGEOF
         local hook="$2"
         local integration="$3"
 
-        # Create file if it doesn't exist
         touch "$rcfile"
 
-        # Check if already injected
         if grep -q "Canopy Hook" "$rcfile" 2>/dev/null; then
-            return 0  # Already present
+            return 0
         fi
 
-        # Append hook and integration
         printf '\n%s\n\n%s\n' "$hook" "$integration" >> "$rcfile"
     }
 
@@ -256,16 +249,11 @@ PLISTEOF
     info "Daemon started"
 }
 
-# --- 8. Get device ID ---
-DEVICE_ID=$("${INSTALL_DIR}/${BINARY_NAME}" version 2>/dev/null | grep -o 'Device:.*' | awk '{print $2}' || echo "unknown")
-HOSTNAME=$(hostname -s 2>/dev/null || hostname)
-
-# --- 9. Post-install output ---
+# --- 8. Post-install output ---
 echo ""
-info "canopyd installed to ${INSTALL_DIR}/${BINARY_NAME}"
+info "canopyd installed successfully!"
 info "Shell hooks added to ~/.zshrc"
-info "Daemon started"
-info "Device ID: ${DEVICE_ID} (${HOSTNAME})"
+info "Daemon started via launchd"
 echo ""
 echo "  To pair your iPhone:"
 echo "    canopyd pair"
