@@ -1,12 +1,41 @@
+# OS
 .DS_Store
+Thumbs.db
+
+# Editor
 *.swp
 *.swo
 *~
 
-# Swift
+# Internal docs
+PLAN.md
+
+# Swift / Xcode
 ios/Canopy/.build/
 ios/Canopy/.swiftpm/
+ios/Canopy/Canopy.xcodeproj/
+*.xcuserdata/
+xcuserdata/
+*.xcworkspace/
+!*.xcworkspace/contents.xcworkspacedata
+DerivedData/
+*.ipa
+*.dSYM.zip
+*.dSYM
 
 # Go
 daemon/canopyd
 daemon/canopyd-*
+daemon/bin/
+coord/coord
+
+# Build artifacts
+*.o
+*.a
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+!*.key.example
