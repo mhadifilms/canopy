@@ -39,6 +39,9 @@ type Daemon struct {
 	listener    net.Listener
 	mu          sync.Mutex
 	cancel      context.CancelFunc
+	// ctx is the daemon's root context, used for background work that should
+	// terminate on shutdown (e.g. push notification dispatches).
+	ctx context.Context
 
 	// Per-session parser pipelines. Protected by pipelineMu.
 	pipelineMu sync.Mutex
@@ -76,6 +79,7 @@ func (d *Daemon) Store() *storage.Store {
 func (d *Daemon) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	d.cancel = cancel
+	d.ctx = ctx
 	defer cancel()
 
 	// 1. Initialize storage.
@@ -383,10 +387,17 @@ func (d *Daemon) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 func (d *Daemon) handleRegister(reg protocol.SessionRegister, conn net.Conn) (*session.Session, string) {
+	shell := reg.Shell
+	if shell == "" {
+		if envShell, ok := reg.Env["SHELL"]; ok {
+			shell = envShell
+		}
+	}
+
 	meta := &session.Meta{
 		SessionID:      reg.SessionID,
 		StartedAt:      reg.RegisteredAt,
-		Shell:          reg.CWD, // Will be updated when we detect the shell
+		Shell:          shell,
 		InitialCWD:     reg.CWD,
 		CurrentCWD:     reg.CWD,
 		TerminalRows:   reg.Rows,
@@ -456,7 +467,7 @@ func (d *Daemon) consumePipelineEvents(sess *session.Session, pipeline *parser.P
 
 		// Evaluate push notification triggers.
 		if d.pushSvc != nil {
-			d.pushSvc.HandleEvent(context.Background(), sess.Meta.SessionID, event)
+			d.pushSvc.HandleEvent(d.ctx, sess.Meta.SessionID, event)
 		}
 
 		// Update session metadata based on event type.
@@ -608,7 +619,10 @@ func (d *Daemon) handleSessionDisconnect(sess *session.Session) {
 			m.EndedAt = &now
 			m.Status = session.StatusEnded
 		})
-		d.store.UpdateMeta(sess.Meta)
+		if err := d.store.UpdateMeta(sess.Meta); err != nil {
+			d.logger.Error("update meta on disconnect", zap.Error(err),
+				zap.String("session_id", sess.Meta.SessionID))
+		}
 
 		if d.apiSrv != nil {
 			d.apiSrv.BroadcastSessionStatus(sess.Meta.SessionID, string(session.StatusEnded), prevStatus, "disconnected")

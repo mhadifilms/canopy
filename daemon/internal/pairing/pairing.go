@@ -1,13 +1,30 @@
-// Package pairing implements Phase 1 manual-code pairing between canopyd and the Canopy iOS app.
+// Package pairing implements manual-code pairing between canopyd and the Canopy iOS app.
+//
+// Two flows are supported:
+//
+//  1. Local-socket flow (same machine / same network). A Unix socket is opened
+//     at {sockpath}.pair and accepts a JSON request from a phone/CLI test tool.
+//  2. Coordination-server flow (WAN). The Mac POSTs its hostname, device ID,
+//     WireGuard public key, and identity key to `/v1/pairing/initiate` on the
+//     coord server. The phone polls `/v1/pairing/{code}/status` to retrieve
+//     the Mac's info and then stores a pairing binding on its side.
+//
+// The iOS app currently only implements flow (2). Both flows are exposed so
+// either can be used; they are mutually compatible and terminate the same way.
 package pairing
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"time"
 
 	"github.com/canopy-dev/canopyd/internal/config"
@@ -56,10 +73,10 @@ func GenerateCode() (PairingCode, error) {
 	return PairingCode(code), nil
 }
 
-// StartPairing initiates a pairing session. It listens on the daemon socket for
-// a pairing request, validates the code, and stores the paired device.
-//
-// This is Phase 1: manual code entry. No QR code yet.
+// StartPairing initiates a pairing session. It publishes the Mac's info to the
+// coordination server under a fresh 6-digit code (so a remote phone can
+// discover it), and simultaneously listens on a local Unix socket for
+// same-network clients.
 func StartPairing(ctx context.Context, timeout time.Duration) error {
 	code, err := GenerateCode()
 	if err != nil {
@@ -85,6 +102,16 @@ func StartPairing(ctx context.Context, timeout time.Duration) error {
 	}
 	deviceID := install.DeviceIDFromPublicKey(pub)
 
+	// Publish to coord so the iOS app can poll /v1/pairing/{code}/status and
+	// retrieve the Mac's identity + WireGuard keys. Best-effort: if the coord
+	// server is unreachable, fall back to the local-socket flow.
+	cfg, cfgErr := config.Load()
+	if cfgErr == nil && cfg.CoordURL != "" {
+		if err := publishToCoord(ctx, cfg.CoordURL, string(code), hostname, deviceID, configDir); err != nil {
+			fmt.Printf("  Note: could not publish pairing code to coord server: %s\n", err)
+		}
+	}
+
 	fmt.Println()
 	fmt.Println("  Pairing mode active")
 	fmt.Println()
@@ -97,6 +124,75 @@ func StartPairing(ctx context.Context, timeout time.Duration) error {
 	fmt.Println()
 
 	return waitForPairing(ctx, session, deviceID)
+}
+
+// publishToCoord posts the Mac's info under the given pairing code so a remote
+// phone can retrieve it via /v1/pairing/{code}/status. The signature binds the
+// identity key + WG key to the code, matching the coord server's canonical
+// pairing message.
+func publishToCoord(ctx context.Context, coordURL, code, hostname, deviceID, configDir string) error {
+	priv, err := loadIdentityPrivateKey(configDir)
+	if err != nil {
+		return fmt.Errorf("load identity private key: %w", err)
+	}
+	pub, err := install.LoadIdentityPublicKey(configDir)
+	if err != nil {
+		return fmt.Errorf("load identity public key: %w", err)
+	}
+	wgPubKey, err := readFileString(configDir, "wg_public.key")
+	if err != nil {
+		return fmt.Errorf("read wg_public.key: %w", err)
+	}
+	wgPubB64 := base64.StdEncoding.EncodeToString([]byte(wgPubKey))
+	identityB64 := base64.StdEncoding.EncodeToString(pub)
+
+	// Canonical message: matches auth.CanonicalPairingMessage("initiate", ...)
+	// on the coord server. Keep these strings in sync.
+	canonical := []byte("canopy/pairing/initiate/v1\n" + code + "\n" + identityB64 + "\n" + wgPubB64)
+	sig := ed25519.Sign(priv, canonical)
+
+	body, err := json.Marshal(map[string]string{
+		"code":      code,
+		"hostname":  hostname,
+		"device_id": deviceID,
+		"wg_pub":    wgPubB64,
+		"identity":  identityB64,
+		"sig":       base64.StdEncoding.EncodeToString(sig),
+	})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", coordURL+"/v1/pairing/initiate", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+// loadIdentityPrivateKey reads the raw Ed25519 private key from disk.
+func loadIdentityPrivateKey(configDir string) (ed25519.PrivateKey, error) {
+	data, err := config.ReadFileInDir(configDir, "identity.key")
+	if err != nil {
+		return nil, err
+	}
+	if len(data) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("unexpected private key length %d", len(data))
+	}
+	return ed25519.PrivateKey(data), nil
 }
 
 // waitForPairing listens on the daemon socket for a pairing request.
@@ -169,14 +265,32 @@ func handlePairingConnection(conn net.Conn, session *Session, macDeviceID string
 
 	// Validate code.
 	if PairingCode(req.Code) != session.Code {
-		errResp := json.NewEncoder(conn)
-		errResp.Encode(map[string]string{"error": "invalid_code"})
+		if err := json.NewEncoder(conn).Encode(map[string]string{"error": "invalid_code"}); err != nil {
+			return fmt.Errorf("write invalid_code response: %w", err)
+		}
 		return fmt.Errorf("invalid pairing code (attempt %d/%d)", session.Attempts, maxAttempts)
 	}
 
-	// Store the paired device.
+	// Require the phone's identity public key so we can derive a stable device ID
+	// and later verify signed traffic from this device. The display name is stored
+	// separately and should never be used as an identifier.
+	if req.PhoneIdentityPK == "" {
+		if err := json.NewEncoder(conn).Encode(map[string]string{"error": "missing_identity"}); err != nil {
+			return fmt.Errorf("write missing_identity response: %w", err)
+		}
+		return fmt.Errorf("missing phone identity public key")
+	}
+	phoneDeviceID, err := deriveDeviceIDFromBase64(req.PhoneIdentityPK)
+	if err != nil {
+		if encErr := json.NewEncoder(conn).Encode(map[string]string{"error": "invalid_identity"}); encErr != nil {
+			return fmt.Errorf("write invalid_identity response: %w", encErr)
+		}
+		return fmt.Errorf("invalid phone identity public key: %w", err)
+	}
+
+	// Store the paired device keyed by identity-derived device ID.
 	device := install.PairedDevice{
-		DeviceID:       req.DeviceName,
+		DeviceID:       phoneDeviceID,
 		Name:           req.DeviceName,
 		WGPublicKey:    req.PhoneWGPubKey,
 		IdentityPubKey: req.PhoneIdentityPK,
@@ -187,8 +301,14 @@ func handlePairingConnection(conn net.Conn, session *Session, macDeviceID string
 	}
 
 	// Read our WireGuard public key for the confirmation.
-	configDir, _ := config.ConfigDir()
-	wgPubKey, _ := readFileString(configDir, "wg_public.key")
+	configDir, err := config.ConfigDir()
+	if err != nil {
+		return fmt.Errorf("locate config dir: %w", err)
+	}
+	wgPubKey, err := readFileString(configDir, "wg_public.key")
+	if err != nil {
+		return fmt.Errorf("read wg_public.key: %w", err)
+	}
 	hostname, _ := config.Hostname()
 
 	// Send confirmation.
@@ -211,4 +331,17 @@ func readFileString(dir, name string) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+// deriveDeviceIDFromBase64 parses a base64-encoded Ed25519 public key and derives
+// the canonical 8-hex-char device ID used throughout the system.
+func deriveDeviceIDFromBase64(pubB64 string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(pubB64)
+	if err != nil {
+		return "", fmt.Errorf("decode base64: %w", err)
+	}
+	if len(raw) != ed25519.PublicKeySize {
+		return "", fmt.Errorf("unexpected key length %d, want %d", len(raw), ed25519.PublicKeySize)
+	}
+	return install.DeviceIDFromPublicKey(ed25519.PublicKey(raw)), nil
 }

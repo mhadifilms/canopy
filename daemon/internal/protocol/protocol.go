@@ -33,6 +33,7 @@ type Frame struct {
 type SessionRegister struct {
 	SessionID    string            `json:"session_id"`
 	ShellPID     int               `json:"shell_pid"`
+	Shell        string            `json:"shell"`
 	TTYName      string            `json:"tty_name"`
 	CWD          string            `json:"cwd"`
 	Rows         int               `json:"rows"`

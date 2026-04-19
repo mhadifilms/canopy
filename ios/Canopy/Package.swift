@@ -15,7 +15,12 @@ let package = Package(
         .target(
             name: "CanopyKit",
             path: "Sources",
-            exclude: ["Views"],
+            // Exclude Views and App from the SwiftPM library target. They depend
+            // on each other and on SwiftUI app lifecycle (@main, UIKit delegate)
+            // so they only make sense inside the Xcode application target
+            // generated from project.yml. SwiftPM is used to run unit tests
+            // against the networking/model/utility layers.
+            exclude: ["Views", "App"],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency"),
             ]

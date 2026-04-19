@@ -27,6 +27,16 @@ type Options struct {
 	Args      []string
 }
 
+// ExitCodeError preserves the child process exit code so callers can propagate
+// it to the outer shell without forcing os.Exit inside the library.
+type ExitCodeError struct {
+	Code int
+}
+
+func (e *ExitCodeError) Error() string {
+	return fmt.Sprintf("child exited with code %d", e.Code)
+}
+
 // Run starts the PTY proxy. It creates an inner PTY running the given command,
 // copies all I/O bidirectionally, and forwards copies to the daemon socket.
 func Run(ctx context.Context, opts Options, logger *zap.Logger) error {
@@ -70,8 +80,14 @@ func Run(ctx context.Context, opts Options, logger *zap.Logger) error {
 	dc.connect()
 	defer dc.close()
 
-	// Send session registration.
-	dc.sendRegister(opts, ptmx)
+	// Send session registration. The shell PID is the PTY child (cmd.Process.Pid),
+	// which is the session leader of its own process group — signals sent with
+	// syscall.Kill(-pid, ...) will be delivered to the shell's process group.
+	shellPID := 0
+	if cmd.Process != nil {
+		shellPID = cmd.Process.Pid
+	}
+	dc.sendRegister(opts, ptmx, shellPID)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -194,8 +210,10 @@ func Run(ctx context.Context, opts Options, logger *zap.Logger) error {
 	case <-time.After(2 * time.Second):
 	}
 
-	os.Exit(exitCode)
-	return nil // unreachable
+	if exitCode != 0 {
+		return &ExitCodeError{Code: exitCode}
+	}
+	return nil
 }
 
 // daemonClient manages the non-blocking connection to the daemon's Unix socket.
@@ -205,6 +223,7 @@ type daemonClient struct {
 	mu        sync.Mutex
 	conn      net.Conn
 	buf       *frameBuf
+	closed    bool
 }
 
 // frameBuf is a bounded buffer for non-blocking socket writes.
@@ -266,16 +285,38 @@ func (dc *daemonClient) connect() {
 	dc.flushBuffer()
 }
 
+// retryConnect retries the daemon socket connection with exponential backoff,
+// capping at 30s between attempts and stopping entirely if the client is closed.
 func (dc *daemonClient) retryConnect() {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
+	backoff := 500 * time.Millisecond
+	const maxBackoff = 30 * time.Second
+	for {
+		dc.mu.Lock()
+		closed := dc.closed
+		dc.mu.Unlock()
+		if closed {
+			return
+		}
+
+		time.Sleep(backoff)
+
 		sockPath := config.SocketPath()
 		conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
 		if err != nil {
+			if backoff < maxBackoff {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
 			continue
 		}
 		dc.mu.Lock()
+		if dc.closed {
+			dc.mu.Unlock()
+			conn.Close()
+			return
+		}
 		dc.conn = conn
 		dc.mu.Unlock()
 		dc.flushBuffer()
@@ -294,8 +335,10 @@ func (dc *daemonClient) flushBuffer() {
 func (dc *daemonClient) close() {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
+	dc.closed = true
 	if dc.conn != nil {
 		dc.conn.Close()
+		dc.conn = nil
 	}
 }
 
@@ -325,7 +368,7 @@ func (dc *daemonClient) writeFrame(f protocol.Frame) error {
 	return protocol.WriteFrame(conn, f)
 }
 
-func (dc *daemonClient) sendRegister(opts Options, ptmx *os.File) {
+func (dc *daemonClient) sendRegister(opts Options, ptmx *os.File, shellPID int) {
 	hostname, _ := os.Hostname()
 	cwd, _ := os.Getwd()
 
@@ -337,7 +380,8 @@ func (dc *daemonClient) sendRegister(opts Options, ptmx *os.File) {
 
 	reg := protocol.SessionRegister{
 		SessionID:    opts.SessionID,
-		ShellPID:     os.Getpid(),
+		ShellPID:     shellPID,
+		Shell:        opts.Command,
 		TTYName:      ptmx.Name(),
 		CWD:          cwd,
 		Rows:         rows,

@@ -42,14 +42,27 @@ func main() {
 
 	st := store.New()
 
-	// Start periodic cleanup of stale devices (every 5 minutes, remove devices older than 10 minutes).
+	// Root context for background workers, cancelled on shutdown.
+	rootCtx, stopRoot := context.WithCancel(context.Background())
+	defer stopRoot()
+
+	// Periodic cleanup of stale devices and expired pairing sessions. Pairing
+	// sessions have a 5-minute TTL, so we sweep them on the same cadence. Both
+	// maps would otherwise grow unbounded under repeated pairing attempts.
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
-			removed := st.Cleanup(10 * time.Minute)
-			if removed > 0 {
-				logger.Info("cleaned stale devices", zap.Int("removed", removed))
+		for {
+			select {
+			case <-rootCtx.Done():
+				return
+			case <-ticker.C:
+				if removed := st.Cleanup(10 * time.Minute); removed > 0 {
+					logger.Info("cleaned stale devices", zap.Int("removed", removed))
+				}
+				if removed := st.CleanupPairingSessions(); removed > 0 {
+					logger.Info("cleaned expired pairing sessions", zap.Int("removed", removed))
+				}
 			}
 		}
 	}()
@@ -92,6 +105,9 @@ func main() {
 	<-sigCh
 
 	logger.Info("shutting down...")
+
+	// Cancel background workers (device/pairing cleanup).
+	stopRoot()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

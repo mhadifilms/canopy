@@ -242,7 +242,9 @@ func (r *Relay) handleAllocate(addr *net.UDPAddr, payload []byte) {
 	resp[0] = RespOK
 	binary.BigEndian.PutUint32(resp[1:5], id)
 	binary.BigEndian.PutUint64(resp[5:13], uint64(alloc.ExpiresAt.Unix()))
-	r.conn.WriteTo(resp, addr)
+	if _, err := r.conn.WriteTo(resp, addr); err != nil {
+		r.logger.Warn("turn write allocation response", zap.Error(err), zap.String("addr", addr.String()))
+	}
 }
 
 // handleRefresh extends an allocation's lifetime.
@@ -280,7 +282,9 @@ func (r *Relay) handleRefresh(addr *net.UDPAddr, payload []byte) {
 	resp[0] = RespOK
 	binary.BigEndian.PutUint32(resp[1:5], id)
 	binary.BigEndian.PutUint64(resp[5:13], uint64(alloc.ExpiresAt.Unix()))
-	r.conn.WriteTo(resp, addr)
+	if _, err := r.conn.WriteTo(resp, addr); err != nil {
+		r.logger.Warn("turn write refresh response", zap.Error(err), zap.String("addr", addr.String()))
+	}
 }
 
 // handleRelease removes an allocation.
@@ -315,7 +319,9 @@ func (r *Relay) handleRelease(addr *net.UDPAddr, payload []byte) {
 	r.logger.Info("turn allocation released", zap.Uint32("id", id))
 
 	resp := []byte{RespOK}
-	r.conn.WriteTo(resp, addr)
+	if _, err := r.conn.WriteTo(resp, addr); err != nil {
+		r.logger.Warn("turn write release response", zap.Error(err), zap.String("addr", addr.String()))
+	}
 }
 
 // handleData relays data to the peer.
@@ -376,10 +382,17 @@ func (r *Relay) relayData(alloc *Allocation, data []byte, target *net.UDPAddr) {
 }
 
 func (r *Relay) sendError(addr *net.UDPAddr, code string) {
+	// Cap the error code length so a pathological caller can't amplify tiny
+	// requests into large responses.
+	if len(code) > 64 {
+		code = code[:64]
+	}
 	msg := make([]byte, 1+len(code))
 	msg[0] = RespError
 	copy(msg[1:], code)
-	r.conn.WriteTo(msg, addr)
+	if _, err := r.conn.WriteTo(msg, addr); err != nil {
+		r.logger.Debug("turn write error response", zap.Error(err))
+	}
 }
 
 func (r *Relay) removeAllocationLocked(id uint32) {

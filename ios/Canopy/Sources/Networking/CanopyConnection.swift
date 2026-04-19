@@ -43,7 +43,7 @@ final class CanopyConnection: Sendable {
     private static let baseReconnectDelay: TimeInterval = 1.0
     private static let maxReconnectDelay: TimeInterval = 30.0
     private static let pingInterval: TimeInterval = 15.0
-    private static let port = 19876
+    private static var port: Int { CanopyConfig.defaultDaemonPort }
 
     init(device: MacDevice) {
         self.device = device
@@ -80,7 +80,13 @@ final class CanopyConnection: Sendable {
         }
 
         let data = try encoder.encode(message)
-        try await task.send(.string(String(data: data, encoding: .utf8)!))
+        // JSONEncoder produces valid UTF-8 by construction, but prefer a safe
+        // fallback over a force-unwrap so a malformed message can't crash the
+        // whole WebSocket pipeline.
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw ConnectionError.encodingFailed
+        }
+        try await task.send(.string(text))
     }
 
     // MARK: - Connection lifecycle

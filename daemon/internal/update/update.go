@@ -172,14 +172,27 @@ func fetchText(client *http.Client, url string) (string, error) {
 	return string(body), nil
 }
 
+// findChecksum parses a sha256sum-style checksums file and returns the hex
+// checksum whose filename column matches binaryName exactly. Substring matches
+// are rejected so that entries like "canopyd-darwin-arm64.backup" do not
+// shadow the real binary checksum.
 func findChecksum(checksums, binaryName string) (string, error) {
 	for _, line := range strings.Split(checksums, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasSuffix(line, binaryName) || strings.Contains(line, binaryName) {
-			parts := strings.Fields(line)
-			if len(parts) >= 1 {
-				return parts[0], nil
-			}
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		// sha256sum format: "<hex>  <filename>". The filename column may be
+		// prefixed with "*" for binary mode; strip it and the optional
+		// leading "./" for comparison.
+		name := strings.TrimPrefix(parts[1], "*")
+		name = strings.TrimPrefix(name, "./")
+		if name == binaryName {
+			return parts[0], nil
 		}
 	}
 	return "", fmt.Errorf("checksum not found for %s", binaryName)

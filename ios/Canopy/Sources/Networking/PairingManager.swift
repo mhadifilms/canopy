@@ -226,7 +226,7 @@ final class PairingManager: NSObject {
                     deviceId: deviceId,
                     wgPublicKey: wgPub,
                     identityPublicKey: identity,
-                    tunnelIP: tunnelIPFromWGKey(wgPub),
+                    tunnelIP: CanopyConfig.tunnelIP(fromWGPublicKeyBase64: wgPub),
                     isOnline: true,
                     lastSeen: Date()
                 )
@@ -243,19 +243,6 @@ final class PairingManager: NSObject {
     func reset() {
         stopScanning()
         state = .idle
-    }
-
-    // MARK: - Helpers
-
-    /// Derive a tunnel IP from a WireGuard public key (deterministic).
-    /// Uses first 2 bytes of SHA256(wg_pub) for the last two octets of 100.100.x.x.
-    private func tunnelIPFromWGKey(_ wgKey: String) -> String {
-        guard let keyData = Data(base64Encoded: wgKey) else {
-            return "100.100.0.1"
-        }
-        let hash = SHA256.hash(data: keyData)
-        let bytes = Array(hash)
-        return "100.100.\(bytes[0]).\(max(1, bytes[1]))"
     }
 }
 

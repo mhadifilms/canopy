@@ -118,10 +118,11 @@ func TestVerifyBearerToken(t *testing.T) {
 	pub, priv := generateTestKeypair(t)
 	pubB64 := base64.StdEncoding.EncodeToString(pub)
 
-	sig := ed25519.Sign(priv, pub)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	sig := ed25519.Sign(priv, []byte(ts))
 	sigB64 := base64.StdEncoding.EncodeToString(sig)
 
-	token := pubB64 + ":" + sigB64
+	token := pubB64 + "." + ts + "." + sigB64
 
 	gotKey, err := VerifyBearerToken(token)
 	if err != nil {
@@ -131,17 +132,25 @@ func TestVerifyBearerToken(t *testing.T) {
 		t.Fatalf("key mismatch: got %q, want %q", gotKey, pubB64)
 	}
 
-	// Invalid token format.
-	if _, err := VerifyBearerToken("no-colon"); err == nil {
-		t.Fatal("expected error for missing colon")
+	// Invalid token format (wrong number of segments).
+	if _, err := VerifyBearerToken("no-dots"); err == nil {
+		t.Fatal("expected error for missing separators")
 	}
 
 	// Wrong signature.
 	_, priv2 := generateTestKeypair(t)
-	badSig := ed25519.Sign(priv2, pub)
+	badSig := ed25519.Sign(priv2, []byte(ts))
 	badSigB64 := base64.StdEncoding.EncodeToString(badSig)
-	badToken := pubB64 + ":" + badSigB64
+	badToken := pubB64 + "." + ts + "." + badSigB64
 	if _, err := VerifyBearerToken(badToken); err == nil {
 		t.Fatal("expected error for wrong signature")
+	}
+
+	// Expired timestamp.
+	oldTS := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
+	oldSig := ed25519.Sign(priv, []byte(oldTS))
+	oldToken := pubB64 + "." + oldTS + "." + base64.StdEncoding.EncodeToString(oldSig)
+	if _, err := VerifyBearerToken(oldToken); err == nil {
+		t.Fatal("expected error for expired timestamp")
 	}
 }

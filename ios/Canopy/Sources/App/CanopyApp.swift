@@ -1,4 +1,7 @@
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
 
 @main
 struct CanopyApp: App {
@@ -37,6 +40,9 @@ struct CanopyApp: App {
             .task {
                 #if os(iOS)
                 appDelegate.appState = appState
+                appDelegate.pushService = appState.pushService
+                await appState.pushService.setup()
+                UIApplication.shared.registerForRemoteNotifications()
                 #endif
                 appState.loadAndConnect()
             }

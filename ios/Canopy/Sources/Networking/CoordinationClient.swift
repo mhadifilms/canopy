@@ -86,10 +86,16 @@ actor CoordinationClient {
 
     /// Look up the current endpoints for a paired Mac by its WireGuard public key.
     func lookupEndpoints(peerWGKey: String) async throws -> EndpointLookupResponse {
-        var components = URLComponents(url: coordURL.appendingPathComponent("v1/endpoints"), resolvingAgainstBaseURL: false)!
+        let base = coordURL.appendingPathComponent("v1/endpoints")
+        guard var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
+            throw CoordinationError.invalidResponse
+        }
         components.queryItems = [URLQueryItem(name: "peer_wg_key", value: peerWGKey)]
+        guard let url = components.url else {
+            throw CoordinationError.invalidResponse
+        }
 
-        var request = URLRequest(url: components.url!)
+        var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("Bearer \(try signedBearerToken())", forHTTPHeaderField: "Authorization")
 

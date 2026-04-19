@@ -14,6 +14,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/canopy-dev/coord/internal/auth"
 	"github.com/canopy-dev/coord/internal/store"
 )
 
@@ -47,8 +48,9 @@ func (d testDevice) sign(msg []byte) string {
 }
 
 func (d testDevice) bearerToken() string {
-	sig := ed25519.Sign(d.priv, d.pub)
-	return d.pubB64 + ":" + base64.StdEncoding.EncodeToString(sig)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	sig := ed25519.Sign(d.priv, []byte(ts))
+	return d.pubB64 + "." + ts + "." + base64.StdEncoding.EncodeToString(sig)
 }
 
 func newTestServer(t *testing.T) (*Server, *store.Store) {
@@ -63,7 +65,7 @@ func TestCheckin(t *testing.T) {
 	dev := newTestDevice(t)
 
 	ts := time.Now().UTC().Format(time.RFC3339)
-	signedMsg := dev.pubB64 + dev.wgPub + ts
+	signedMsg := auth.CanonicalCheckinMessage(dev.pubB64, dev.wgPub, ts)
 
 	body := CheckinRequest{
 		DeviceKey:   dev.pubB64,
@@ -74,7 +76,7 @@ func TestCheckin(t *testing.T) {
 		},
 		PairedDevices: []string{},
 		Timestamp:     ts,
-		Sig:           dev.sign([]byte(signedMsg)),
+		Sig:           dev.sign(signedMsg),
 	}
 
 	bodyJSON, _ := json.Marshal(body)
@@ -106,13 +108,13 @@ func TestCheckinBadSignature(t *testing.T) {
 	other := newTestDevice(t)
 
 	ts := time.Now().UTC().Format(time.RFC3339)
-	signedMsg := dev.pubB64 + dev.wgPub + ts
+	signedMsg := auth.CanonicalCheckinMessage(dev.pubB64, dev.wgPub, ts)
 
 	body := CheckinRequest{
 		DeviceKey:   dev.pubB64,
 		WGPublicKey: dev.wgPub,
 		Timestamp:   ts,
-		Sig:         other.sign([]byte(signedMsg)), // Wrong signer
+		Sig:         other.sign(signedMsg), // Wrong signer
 	}
 
 	bodyJSON, _ := json.Marshal(body)
@@ -244,11 +246,11 @@ func TestRegisterPairing(t *testing.T) {
 	dev := newTestDevice(t)
 	peerWG := base64.StdEncoding.EncodeToString(make([]byte, 32))
 
-	signedMsg := dev.pubB64 + peerWG
+	signedMsg := auth.CanonicalRegisterPairingMessage(dev.pubB64, peerWG)
 	body := RegisterPairingRequest{
 		DeviceKey: dev.pubB64,
 		PeerWGKey: peerWG,
-		Sig:       dev.sign([]byte(signedMsg)),
+		Sig:       dev.sign(signedMsg),
 	}
 
 	bodyJSON, _ := json.Marshal(body)
@@ -273,11 +275,11 @@ func TestRegisterPairingBadSignature(t *testing.T) {
 	other := newTestDevice(t)
 	peerWG := base64.StdEncoding.EncodeToString(make([]byte, 32))
 
-	signedMsg := dev.pubB64 + peerWG
+	signedMsg := auth.CanonicalRegisterPairingMessage(dev.pubB64, peerWG)
 	body := RegisterPairingRequest{
 		DeviceKey: dev.pubB64,
 		PeerWGKey: peerWG,
-		Sig:       other.sign([]byte(signedMsg)), // wrong signer
+		Sig:       other.sign(signedMsg), // wrong signer
 	}
 
 	bodyJSON, _ := json.Marshal(body)
@@ -297,7 +299,7 @@ func TestPush(t *testing.T) {
 
 	body := PushRequest{
 		DeviceKey: dev.pubB64,
-		Sig:       dev.sign([]byte(dev.pubB64)),
+		Sig:       dev.sign(auth.CanonicalPushMessage(dev.pubB64)),
 		Targets: []PushTarget{
 			{
 				APNSToken: "abcdef1234567890abcdef1234567890",
@@ -335,7 +337,7 @@ func TestPushBadSignature(t *testing.T) {
 
 	body := PushRequest{
 		DeviceKey: dev.pubB64,
-		Sig:       other.sign([]byte(dev.pubB64)),
+		Sig:       other.sign(auth.CanonicalPushMessage(dev.pubB64)),
 		Targets:   []PushTarget{{APNSToken: "token123456789012345678901234", Notification: Notification{Title: "t"}}},
 	}
 
@@ -356,7 +358,7 @@ func TestPushNoTargets(t *testing.T) {
 
 	body := PushRequest{
 		DeviceKey: dev.pubB64,
-		Sig:       dev.sign([]byte(dev.pubB64)),
+		Sig:       dev.sign(auth.CanonicalPushMessage(dev.pubB64)),
 		Targets:   []PushTarget{},
 	}
 
@@ -413,14 +415,13 @@ func TestPairingInitiateAndStatus(t *testing.T) {
 
 	// Mac initiates pairing with a 6-digit code.
 	code := "482917"
-	signedMsg := mac.pubB64 + code
 	body := PairingInitiateRequest{
 		Code:     code,
 		Hostname: "test-mac",
 		DeviceID: "mac-device-123",
 		WGPub:    mac.wgPub,
 		Identity: mac.pubB64,
-		Sig:      mac.sign([]byte(signedMsg)),
+		Sig:      mac.sign(auth.CanonicalPairingMessage("initiate", code, mac.pubB64, mac.wgPub)),
 	}
 
 	bodyJSON, _ := json.Marshal(body)
@@ -525,14 +526,13 @@ func TestPairingConfirmFlow(t *testing.T) {
 	}
 
 	// Mac confirms the pairing.
-	signedMsg := mac.pubB64 + code
 	body := PairingConfirmRequest{
 		Code:     code,
 		Hostname: "confirm-mac",
 		DeviceID: "confirm-id",
 		WGPub:    mac.wgPub,
 		Identity: mac.pubB64,
-		Sig:      mac.sign([]byte(signedMsg)),
+		Sig:      mac.sign(auth.CanonicalPairingMessage("confirm", code, mac.pubB64, mac.wgPub)),
 	}
 
 	bodyJSON, _ := json.Marshal(body)
@@ -579,14 +579,13 @@ func TestPairingInitiateBadSignature(t *testing.T) {
 	other := newTestDevice(t)
 
 	code := "111111"
-	signedMsg := mac.pubB64 + code
 	body := PairingInitiateRequest{
 		Code:     code,
 		Hostname: "bad-mac",
 		DeviceID: "bad-id",
 		WGPub:    mac.wgPub,
 		Identity: mac.pubB64,
-		Sig:      other.sign([]byte(signedMsg)), // wrong signer
+		Sig:      other.sign(auth.CanonicalPairingMessage("initiate", code, mac.pubB64, mac.wgPub)), // wrong signer
 	}
 
 	bodyJSON, _ := json.Marshal(body)

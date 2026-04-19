@@ -60,10 +60,13 @@ type Client struct {
 	conn          *websocket.Conn
 	mu            sync.Mutex
 	subscriptions map[string]context.CancelFunc
-	fileReads     int
-	historyReqs   int
-	msgCount      int
-	lastReset     time.Time
+	// Rate-limit counters. Each has its own window so resets are independent.
+	fileReads       int
+	fileReadsReset  time.Time
+	historyReqs     int
+	historyReqReset time.Time
+	msgCount        int
+	msgCountReset   time.Time
 }
 
 // New creates a new API server.
@@ -126,11 +129,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := fmt.Sprintf("client-%d", s.nextID.Add(1))
+	now := time.Now()
 	client := &Client{
-		ID:            id,
-		conn:          conn,
-		subscriptions: make(map[string]context.CancelFunc),
-		lastReset:     time.Now(),
+		ID:              id,
+		conn:            conn,
+		subscriptions:   make(map[string]context.CancelFunc),
+		msgCountReset:   now,
+		fileReadsReset:  now,
+		historyReqReset: now,
 	}
 
 	s.mu.Lock()
@@ -162,15 +168,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Rate limit: reset counters every second for msg/s, every minute for file/history.
+		// Rate limit: per-second window for messages, per-minute for file/history.
 		now := time.Now()
-		if now.Sub(client.lastReset) > time.Second {
+		if now.Sub(client.msgCountReset) > time.Second {
 			client.msgCount = 0
-			if now.Sub(client.lastReset) > time.Minute {
-				client.fileReads = 0
-				client.historyReqs = 0
-				client.lastReset = now
-			}
+			client.msgCountReset = now
 		}
 		client.msgCount++
 		if client.msgCount > maxMsgPerSec {
@@ -337,6 +339,11 @@ func (s *Server) handleUnsubscribe(client *Client, sessionID string) {
 }
 
 func (s *Server) handleGetHistory(ctx context.Context, client *Client, msg IncomingMessage) {
+	now := time.Now()
+	if now.Sub(client.historyReqReset) > time.Minute {
+		client.historyReqs = 0
+		client.historyReqReset = now
+	}
 	client.historyReqs++
 	if client.historyReqs > maxHistoryReqMin {
 		s.sendError(ctx, client, "rate_limited", "too many history requests")
@@ -448,6 +455,11 @@ func (s *Server) handleSignal(ctx context.Context, client *Client, msg IncomingM
 }
 
 func (s *Server) handleReadFile(ctx context.Context, client *Client, msg IncomingMessage) {
+	now := time.Now()
+	if now.Sub(client.fileReadsReset) > time.Minute {
+		client.fileReads = 0
+		client.fileReadsReset = now
+	}
 	client.fileReads++
 	if client.fileReads > maxFileReadsMin {
 		s.sendError(ctx, client, "rate_limited", "too many file reads")

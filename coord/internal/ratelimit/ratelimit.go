@@ -6,6 +6,11 @@ import (
 	"time"
 )
 
+// maxBuckets caps the total number of distinct keys tracked. Prevents a
+// memory-exhaustion attack from a client that rotates identities rapidly.
+// When the cap is reached, the least-recently-used bucket is evicted.
+const maxBuckets = 100_000
+
 // Limiter implements per-key token-bucket rate limiting.
 type Limiter struct {
 	mu      sync.Mutex
@@ -40,6 +45,20 @@ func (l *Limiter) Allow(key string) bool {
 	now := time.Now()
 	b, ok := l.buckets[key]
 	if !ok {
+		if len(l.buckets) >= maxBuckets {
+			// Evict the least-recently-used bucket to make room.
+			var oldestKey string
+			var oldestTime time.Time
+			first := true
+			for k, v := range l.buckets {
+				if first || v.lastTime.Before(oldestTime) {
+					oldestKey = k
+					oldestTime = v.lastTime
+					first = false
+				}
+			}
+			delete(l.buckets, oldestKey)
+		}
 		b = &bucket{
 			tokens:   float64(l.burst) - 1,
 			lastTime: now,

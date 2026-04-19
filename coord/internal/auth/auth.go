@@ -50,6 +50,31 @@ func VerifySignature(pubKeyB64, signatureB64 string, message []byte) error {
 	return nil
 }
 
+// CanonicalCheckinMessage produces the exact bytes that both daemon and server
+// sign/verify for a check-in. Fields are newline-separated with a versioned
+// prefix so adjacent-field collisions are impossible and the scheme can evolve.
+func CanonicalCheckinMessage(deviceKey, wgPublicKey, timestamp string) []byte {
+	return []byte("canopy/checkin/v1\n" + deviceKey + "\n" + wgPublicKey + "\n" + timestamp)
+}
+
+// CanonicalRegisterPairingMessage produces the canonical signed message for
+// /v1/register_pairing requests.
+func CanonicalRegisterPairingMessage(deviceKey, peerWGKey string) []byte {
+	return []byte("canopy/register_pairing/v1\n" + deviceKey + "\n" + peerWGKey)
+}
+
+// CanonicalPushMessage produces the canonical signed message for /v1/push.
+func CanonicalPushMessage(deviceKey string) []byte {
+	return []byte("canopy/push/v1\n" + deviceKey)
+}
+
+// CanonicalPairingMessage produces the canonical signed message for pairing
+// initiate/confirm requests. Stage is "initiate" or "confirm" and binds the
+// identity + WG public key to the 6-digit code to stop cross-stage replay.
+func CanonicalPairingMessage(stage, code, identity, wgPublicKey string) []byte {
+	return []byte("canopy/pairing/" + stage + "/v1\n" + code + "\n" + identity + "\n" + wgPublicKey)
+}
+
 // DeviceIDFromPublicKey derives a human-readable device ID from an Ed25519 public key.
 // Compatible with daemon's install.DeviceIDFromPublicKey and wireguard.DeviceID.
 // Uses first 8 bytes of SHA256(pubkey), hex-encoded, truncated to 8 chars.
@@ -87,22 +112,30 @@ func ValidateTimestamp(ts string) error {
 }
 
 // VerifyBearerToken validates a signed bearer token for endpoint lookups.
-// Token format: base64(pubkey):base64(signature_of_pubkey)
+//
+// Token format: base64(pubkey).timestamp.base64(signature_of_timestamp)
+// The signature must cover the exact timestamp bytes (RFC3339). The timestamp
+// is additionally validated against MaxTimestampAge to block replay.
+//
+// Period ('.') is safe as a separator because standard base64 produces only
+// [A-Za-z0-9+/=] and RFC3339 timestamps contain only digits, '-', 'T', ':',
+// '.', '+', and 'Z' — none of which collide ambiguously with the separator
+// when SplitN with n=3 is used.
 func VerifyBearerToken(token string) (pubKeyB64 string, err error) {
-	parts := strings.SplitN(token, ":", 2)
-	if len(parts) != 2 {
+	parts := strings.SplitN(token, ".", 3)
+	if len(parts) != 3 {
 		return "", fmt.Errorf("%w: invalid token format", ErrInvalidSignature)
 	}
 
 	pubKeyB64 = parts[0]
-	sigB64 := parts[1]
+	timestamp := parts[1]
+	sigB64 := parts[2]
 
-	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKeyB64)
-	if err != nil {
-		return "", fmt.Errorf("%w: decode key: %v", ErrInvalidKey, err)
+	if err := ValidateTimestamp(timestamp); err != nil {
+		return "", err
 	}
 
-	if err := VerifySignature(pubKeyB64, sigB64, pubKeyBytes); err != nil {
+	if err := VerifySignature(pubKeyB64, sigB64, []byte(timestamp)); err != nil {
 		return "", err
 	}
 

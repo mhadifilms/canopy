@@ -205,9 +205,9 @@ func (c *Client) checkin(ctx context.Context, endpoints []Endpoint) error {
 	copy(pairedKeys, c.pairedWGKeys)
 	c.mu.RUnlock()
 
-	// Sign: device_key + wg_public_key + timestamp
-	signedMessage := c.pubKeyB64 + c.wgPubKeyB64 + ts
-	sig := ed25519.Sign(c.identityPriv, []byte(signedMessage))
+	// Sign a canonical string with explicit field separators so adjacent field
+	// contents cannot collide (e.g. {key:"ab",wg:"cd"} vs {key:"a",wg:"bcd"}).
+	sig := ed25519.Sign(c.identityPriv, canonicalCheckinMessage(c.pubKeyB64, c.wgPubKeyB64, ts))
 	sigB64 := base64.StdEncoding.EncodeToString(sig)
 
 	body := map[string]interface{}{
@@ -246,11 +246,7 @@ func (c *Client) checkin(ctx context.Context, endpoints []Endpoint) error {
 
 // LookupEndpoints queries the coordination server for a peer's endpoints.
 func (c *Client) LookupEndpoints(ctx context.Context, peerWGKeyB64 string) ([]Endpoint, bool, error) {
-	// Build bearer token: base64(pubkey):base64(sig_of_pubkey_bytes)
-	pubKeyBytes := []byte(c.identityPub)
-	sig := ed25519.Sign(c.identityPriv, pubKeyBytes)
-	sigB64 := base64.StdEncoding.EncodeToString(sig)
-	token := c.pubKeyB64 + ":" + sigB64
+	token := c.signedBearerToken()
 
 	u := c.coordURL + "/v1/endpoints?peer_wg_key=" + url.QueryEscape(peerWGKeyB64)
 
@@ -287,8 +283,7 @@ func (c *Client) LookupEndpoints(ctx context.Context, peerWGKeyB64 string) ([]En
 
 // RegisterPairing tells the coordination server about a new pairing.
 func (c *Client) RegisterPairing(ctx context.Context, peerWGKeyB64 string) error {
-	signedMessage := c.pubKeyB64 + peerWGKeyB64
-	sig := ed25519.Sign(c.identityPriv, []byte(signedMessage))
+	sig := ed25519.Sign(c.identityPriv, canonicalRegisterPairingMessage(c.pubKeyB64, peerWGKeyB64))
 	sigB64 := base64.StdEncoding.EncodeToString(sig)
 
 	body := map[string]string{
@@ -338,7 +333,7 @@ func (c *Client) SendPush(ctx context.Context, targets []PushTarget) error {
 		return nil
 	}
 
-	sig := ed25519.Sign(c.identityPriv, []byte(c.pubKeyB64))
+	sig := ed25519.Sign(c.identityPriv, canonicalPushMessage(c.pubKeyB64))
 	sigB64 := base64.StdEncoding.EncodeToString(sig)
 
 	body := map[string]interface{}{
@@ -500,6 +495,35 @@ func parseSTUNBindingResponse(data []byte) (net.IP, int, error) {
 	}
 
 	return nil, 0, fmt.Errorf("XOR-MAPPED-ADDRESS not found in stun response")
+}
+
+// signedBearerToken builds a short-lived, timestamped bearer token for GET
+// endpoints that rely on `Authorization: Bearer`. Format:
+// base64(pubkey).timestamp.base64(sig_of_timestamp).
+func (c *Client) signedBearerToken() string {
+	ts := time.Now().UTC().Format(time.RFC3339)
+	sig := ed25519.Sign(c.identityPriv, []byte(ts))
+	return c.pubKeyB64 + "." + ts + "." + base64.StdEncoding.EncodeToString(sig)
+}
+
+// canonicalCheckinMessage produces the exact bytes both sides sign/verify for
+// a check-in request. Fields are newline-separated so field boundaries are
+// unambiguous (base64 and RFC3339 never contain '\n').
+func canonicalCheckinMessage(deviceKey, wgPublicKey, timestamp string) []byte {
+	return []byte("canopy/checkin/v1\n" + deviceKey + "\n" + wgPublicKey + "\n" + timestamp)
+}
+
+// canonicalRegisterPairingMessage produces the exact bytes signed/verified for
+// a pairing registration.
+func canonicalRegisterPairingMessage(deviceKey, peerWGKey string) []byte {
+	return []byte("canopy/register_pairing/v1\n" + deviceKey + "\n" + peerWGKey)
+}
+
+// canonicalPushMessage produces the exact bytes signed/verified for a push
+// notification request. Only the device key is signed; per-target payloads
+// are authenticated by APNs itself when the coord server forwards them.
+func canonicalPushMessage(deviceKey string) []byte {
+	return []byte("canopy/push/v1\n" + deviceKey)
 }
 
 // getLocalIPs returns the machine's non-loopback IPv4 addresses.

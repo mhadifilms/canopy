@@ -5,8 +5,9 @@ private let logger = Logger(subsystem: "dev.canopy.app", category: "AppState")
 
 /// Root application state.
 ///
-/// Owns all stores and the connection manager. Injected into the SwiftUI
-/// environment as an `@Observable` object.
+/// Owns all stores, the connection manager, the push notification service, and
+/// the tunnel manager. Injected into the SwiftUI environment as an
+/// `@Observable` object.
 @MainActor
 @Observable
 final class AppState {
@@ -15,6 +16,12 @@ final class AppState {
     let eventStore: EventStore
     let router: MessageRouter
     let connectionManager: ConnectionManager
+
+    #if os(iOS)
+    /// Push notification service — owns APNs registration, categories, and
+    /// the approve/reject action pipeline from the lock screen.
+    let pushService: PushNotificationService
+    #endif
 
     /// The currently selected/viewed session ID.
     var selectedSessionId: String?
@@ -50,14 +57,39 @@ final class AppState {
         self.eventStore = eventStore
         self.router = router
         self.connectionManager = connectionManager
+        #if os(iOS)
+        self.pushService = PushNotificationService()
+        #endif
 
-        // Wire up router callbacks
+        // Wire up router callbacks. The `self?` guard is intentional: during
+        // app teardown the router can outlive AppState (e.g. a final message
+        // arrives while the scene is tearing down); in that case we drop
+        // the payload silently, which is correct.
         router.onFileContents = { [weak self] payload in
             self?.handleFileContents(payload)
         }
         router.onSearchResults = { [weak self] payload in
             self?.handleSearchResults(payload)
         }
+
+        #if os(iOS)
+        // Route lock-screen approve/reject actions through AppState so the
+        // normal approveAction/rejectAction code paths are reused.
+        pushService.onApprovalAction = { [weak self] sessionId, approved, _ in
+            guard let self else { return }
+            if approved {
+                await self.approveAction(for: sessionId)
+            } else {
+                await self.rejectAction(for: sessionId)
+            }
+        }
+        pushService.onOpenSession = { [weak self] sessionId, _ in
+            Task { @MainActor in
+                self?.pendingDeepLinkSessionId = sessionId
+                self?.selectedSessionId = sessionId
+            }
+        }
+        #endif
     }
 
     // MARK: - Device management
@@ -249,7 +281,7 @@ final class AppState {
         isSearching = false
     }
 
-    // MARK: - Persistence (placeholder — real implementation uses Keychain)
+    // MARK: - Persistence
 
     private func savePairedDevices() {
         do {
